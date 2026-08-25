@@ -1,0 +1,67 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from PIL import Image
+
+from backend.autopick.config import Settings
+from backend.autopick.services import ProjectService
+
+
+def write_image(path: Path, color: tuple[int, int, int]) -> None:
+    Image.new("RGB", (1200, 800), color).save(path, "JPEG")
+
+
+def make_template(path: Path) -> None:
+    # Only existence/extension are used by project creation in this unit test.
+    path.write_bytes(b"placeholder")
+
+
+def test_project_photo_paths_are_physically_isolated(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    settings = Settings(data_root, None, True, "test-token")
+    service = ProjectService(settings)
+    gallery_a, gallery_b = tmp_path / "a", tmp_path / "b"
+    gallery_a.mkdir(); gallery_b.mkdir()
+    write_image(gallery_a / "same-name.jpg", (200, 20, 20))
+    write_image(gallery_b / "same-name.jpg", (20, 20, 200))
+    template = tmp_path / "template.docm"; make_template(template)
+
+    a = service.create_project("Factory A", str(gallery_a), str(template), None)
+    b = service.create_project("Factory B", str(gallery_b), str(template), None)
+    with pytest.raises(ValueError):
+        service._safe_relative(service.project_root(b["id"]), f"../{a['id']}/originals/forbidden.jpg")
+
+    with service.db_path(a["id"]).open("rb") as handle_a, service.db_path(b["id"]).open("rb") as handle_b:
+        assert handle_a.read() != handle_b.read()
+
+
+def test_vector_search_and_confirmation_never_cross_projects(tmp_path: Path) -> None:
+    settings = Settings(tmp_path / "data", None, True, "test-token")
+    service = ProjectService(settings)
+    gallery_a, gallery_b = tmp_path / "a", tmp_path / "b"
+    gallery_a.mkdir(); gallery_b.mkdir()
+    write_image(gallery_a / "gate.jpg", (210, 30, 30))
+    write_image(gallery_a / "line.jpg", (180, 30, 30))
+    write_image(gallery_b / "gate.jpg", (30, 30, 210))
+    write_image(gallery_b / "line.jpg", (30, 30, 180))
+    template = tmp_path / "template.docm"; make_template(template)
+
+    a = service.create_project("Factory A", str(gallery_a), str(template), None)
+    b = service.create_project("Factory B", str(gallery_b), str(template), None)
+    for project in (a, b):
+        job = service.start_index(project["id"])
+        service._jobs[job["id"]].join(timeout=10)
+        assert service.get_job(project["id"], job["id"])["status"] == "completed"
+
+    b_results = service.search(b["id"], "factory gate", 10)
+    assert b_results
+    b_root = service.project_root(b["id"])
+    for candidate in b_results:
+        assert b_root in service.safe_photo_path(b["id"], candidate["photo_id"]).parents
+
+    a_slot = service.list_slots(a["id"])[0]
+    b_photo = b_results[0]["photo_id"]
+    with pytest.raises(ValueError, match="当前项目"):
+        service.confirm(a["id"], a_slot["id"], [b_photo])

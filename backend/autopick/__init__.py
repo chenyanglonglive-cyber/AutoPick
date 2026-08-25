@@ -1,0 +1,1 @@
+"""Core AutoPick application modules."""

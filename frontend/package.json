@@ -1,0 +1,21 @@
+{
+  "name": "autopick-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@vitejs/plugin-vue": "latest",
+    "pinia": "latest",
+    "vue": "latest"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "vite": "latest",
+    "vue-tsc": "latest"
+  }
+}
