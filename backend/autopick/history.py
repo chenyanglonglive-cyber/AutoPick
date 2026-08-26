@@ -7,6 +7,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from backend.autopick.images import dhash_bytes, hamming_distance
+from backend.autopick.report_layout import extract_report_slots
 
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -25,6 +26,7 @@ class HistoryMedia:
 
 def extract_history_media(report_path: Path) -> list[HistoryMedia]:
     """Read a DOCX/DOCM package without modifying it and retain nearby table text."""
+    slot_context = {slot.media_name: slot.caption for slot in extract_report_slots(report_path) if slot.media_name}
     with zipfile.ZipFile(report_path) as package:
         document = ET.fromstring(package.read("word/document.xml"))
         relationships = ET.fromstring(package.read("word/_rels/document.xml.rels"))
@@ -33,14 +35,14 @@ def extract_history_media(report_path: Path) -> list[HistoryMedia]:
             for node in relationships.findall(f"{{{REL}}}Relationship")
             if node.attrib.get("Target", "").startswith("media/")
         }
-        contexts: dict[str, str] = {}
+        contexts: dict[str, str] = {f"media/{name}": caption for name, caption in slot_context.items()}
         for row in document.iter(f"{{{W}}}tr"):
             text = " ".join(node.text or "" for node in row.iter(f"{{{W}}}t")).strip()
             for blip in row.iter(f"{{{A}}}blip"):
                 relation_id = blip.attrib.get(f"{{{R}}}embed")
                 target = relation_targets.get(relation_id or "")
                 if target:
-                    contexts[target] = text[:1000]
+                    contexts[target] = contexts.get(target) or text[:1000]
         result: list[HistoryMedia] = []
         for target in relation_targets.values():
             zip_name = f"word/{target}"

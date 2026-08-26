@@ -22,10 +22,13 @@ from backend.autopick.schemas import (
     RejectRequest,
     ReportResponse,
     SearchRequest,
-    TemplateMappingRequest,
+    TemplateReplaceRequest,
     HistoryImportRequest,
 )
 from backend.autopick.services import ProjectNotFoundError, ProjectService
+
+
+API_VERSION = "2026-08-26"
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -57,7 +60,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/health")
     def health() -> dict:
-        return {"status": "ok", "data_root": str(settings.data_root), "qwen_configured": bool(settings.dashscope_api_key)}
+        return {
+            "status": "ok",
+            "api_version": API_VERSION,
+            "data_root": str(settings.data_root),
+            "qwen_configured": bool(settings.dashscope_api_key),
+        }
 
     @app.get("/api/projects", response_model=list[ProjectSummary], dependencies=[Depends(require_session)])
     def list_projects() -> list[dict]:
@@ -98,7 +106,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/projects/{project_id}/gallery/search", response_model=list[GalleryPhotoResponse], dependencies=[Depends(require_session)])
     def search_gallery(project_id: str, payload: SearchRequest) -> list[dict]:
-        return projects.search_gallery(project_id, payload.query, max(payload.top_k, 120))
+        return projects.search_gallery(project_id, payload.query, payload.top_k)
 
     @app.post("/api/projects/{project_id}/ocr", response_model=JobResponse, dependencies=[Depends(require_session)])
     def ocr_project(project_id: str) -> dict:
@@ -126,23 +134,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/api/projects/{project_id}/slots/confirm-top", dependencies=[Depends(require_session)])
+    def confirm_top_candidates(project_id: str) -> dict:
+        try:
+            return projects.confirm_all_top_candidates(project_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/projects/{project_id}/slots/{slot_id}/reject", dependencies=[Depends(require_session)])
     def reject(project_id: str, slot_id: str, payload: RejectRequest) -> dict:
         projects.reject(project_id, slot_id, payload.photo_id, payload.reason)
         return {"status": "rejected"}
 
-    @app.post("/api/projects/{project_id}/template/map", dependencies=[Depends(require_session)])
-    def map_template(project_id: str, payload: TemplateMappingRequest) -> dict:
+    @app.post("/api/projects/{project_id}/template/analyze", dependencies=[Depends(require_session)])
+    def analyze_template(project_id: str) -> dict:
         try:
-            projects.set_mapping(project_id, payload.slot_id, payload.bookmark)
-            return {"status": "mapped"}
+            return reports.analyze_template(project_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.get("/api/projects/{project_id}/template/bookmarks", dependencies=[Depends(require_session)])
-    def template_bookmarks(project_id: str) -> dict:
+    @app.post("/api/projects/{project_id}/template/replace", dependencies=[Depends(require_session)])
+    def replace_template(project_id: str, payload: TemplateReplaceRequest) -> dict:
         try:
-            return {"bookmarks": projects.template_bookmarks(project_id)}
+            return projects.replace_template(project_id, payload.template_path)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/projects/{project_id}/report/match", dependencies=[Depends(require_session)])
+    def match_report(project_id: str) -> dict:
+        try:
+            return reports.auto_match(project_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/projects/{project_id}/report/coverage", dependencies=[Depends(require_session)])
+    def report_coverage(project_id: str) -> dict:
+        try:
+            return reports.coverage(project_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/projects/{project_id}/report/preflight", dependencies=[Depends(require_session)])
+    def report_preflight(project_id: str) -> dict:
+        try:
+            return reports.preflight(project_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -23,6 +23,11 @@ class ProjectSummary(BaseModel):
     indexed_count: int = 0
     confirmed_count: int = 0
     slot_count: int = 0
+    template_name: str = ""
+
+
+class TemplateReplaceRequest(BaseModel):
+    template_path: str = Field(min_length=1)
 
 
 class JobResponse(BaseModel):
@@ -39,7 +44,7 @@ class JobResponse(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=500)
-    top_k: int = Field(default=30, ge=1, le=80)
+    top_k: int = Field(default=30, ge=1, le=200)
     target_slot_id: str | None = None
 
 
@@ -50,11 +55,6 @@ class ConfirmRequest(BaseModel):
 class RejectRequest(BaseModel):
     photo_id: str
     reason: str | None = Field(default=None, max_length=500)
-
-
-class TemplateMappingRequest(BaseModel):
-    slot_id: str
-    bookmark: str = Field(min_length=1, max_length=160)
 
 
 class HistoryImportRequest(BaseModel):
@@ -102,6 +102,7 @@ class ReportResponse(BaseModel):
     output_path: str
     manifest_path: str
     selection_export_path: str
+    qa_pdf_path: str | None = None
     warnings: list[str] = []
 
 

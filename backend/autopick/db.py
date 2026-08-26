@@ -18,6 +18,12 @@ CREATE TABLE IF NOT EXISTS preference_profiles (
     version INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS template_blueprints (
+    fingerprint TEXT PRIMARY KEY,
+    template_name TEXT NOT NULL,
+    slots_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 PROJECT_SCHEMA = """
@@ -145,6 +151,69 @@ CREATE TABLE IF NOT EXISTS report_manifest (
     bookmark TEXT NOT NULL,
     confirmed_at TEXT NOT NULL,
     PRIMARY KEY(report_id, slot_id, photo_id)
+);
+CREATE TABLE IF NOT EXISTS report_slots (
+    id TEXT PRIMARY KEY,
+    template_fingerprint TEXT NOT NULL,
+    slot_key TEXT NOT NULL,
+    table_index INTEGER NOT NULL,
+    row_index INTEGER NOT NULL,
+    cell_index INTEGER NOT NULL,
+    image_kind TEXT NOT NULL,
+    media_name TEXT,
+    caption TEXT NOT NULL,
+    section TEXT,
+    width_emu INTEGER,
+    height_emu INTEGER,
+    checklist_slot_id TEXT,
+    mapping_confidence REAL NOT NULL DEFAULT 0,
+    mandatory INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    UNIQUE(template_fingerprint, slot_key),
+    FOREIGN KEY(checklist_slot_id) REFERENCES checklist_slots(id)
+);
+CREATE TABLE IF NOT EXISTS report_slot_candidates (
+    report_slot_id TEXT NOT NULL,
+    photo_id TEXT NOT NULL,
+    semantic_score REAL NOT NULL,
+    ocr_score REAL NOT NULL DEFAULT 0,
+    quality_score REAL NOT NULL,
+    aspect_score REAL NOT NULL DEFAULT 0,
+    total_score REAL NOT NULL,
+    rank INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(report_slot_id, photo_id),
+    FOREIGN KEY(report_slot_id) REFERENCES report_slots(id) ON DELETE CASCADE,
+    FOREIGN KEY(photo_id) REFERENCES photos(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS report_slot_selections (
+    report_slot_id TEXT PRIMARY KEY,
+    photo_id TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    selected_at TEXT NOT NULL,
+    source TEXT NOT NULL,
+    FOREIGN KEY(report_slot_id) REFERENCES report_slots(id) ON DELETE CASCADE,
+    FOREIGN KEY(photo_id) REFERENCES photos(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS report_runs (
+    id TEXT PRIMARY KEY,
+    template_fingerprint TEXT NOT NULL,
+    output_relative_path TEXT,
+    qa_pdf_relative_path TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS report_slot_manifest (
+    report_id TEXT NOT NULL,
+    report_slot_id TEXT NOT NULL,
+    checklist_slot_id TEXT,
+    photo_id TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    caption TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    selected_at TEXT NOT NULL,
+    PRIMARY KEY(report_id, report_slot_id),
+    FOREIGN KEY(report_slot_id) REFERENCES report_slots(id) ON DELETE CASCADE,
+    FOREIGN KEY(photo_id) REFERENCES photos(id)
 );
 CREATE TABLE IF NOT EXISTS history_matches (
     id TEXT PRIMARY KEY,

@@ -28,7 +28,11 @@ from backend.autopick.images import (
     sha256_file,
 )
 from backend.autopick.history import extract_history_media
+from backend.autopick.report_layout import best_checklist_match, normalize_label
 from backend.autopick.qwen import QwenEmbeddingClient, QwenOcrClient
+
+
+AUTO_CONFIRM_THRESHOLD = 0.35
 
 
 def utcnow() -> str:
@@ -51,8 +55,11 @@ class ProjectService:
         if not project_id or any(value in project_id for value in ("/", "\\", "..")):
             raise ProjectNotFoundError("Invalid project identifier")
         root = self.settings.projects_root / project_id
-        if not (root / "project.sqlite").exists():
+        database = root / "project.sqlite"
+        if not database.exists():
             raise ProjectNotFoundError(f"Project {project_id} was not found")
+        # Schema additions must also reach projects created by earlier versions.
+        initialize_project(database)
         return root
 
     def db_path(self, project_id: str) -> Path:
@@ -187,7 +194,35 @@ class ProjectService:
                           (SELECT COUNT(DISTINCT slot_id) FROM confirmations) AS confirmed_count,
                           (SELECT COUNT(*) FROM checklist_slots) AS slot_count"""
             ).fetchone()
-        return {**project, **dict(counts)}
+        return {
+            **project,
+            **dict(counts),
+            "template_name": Path(project["template_relative_path"]).name,
+        }
+
+    def replace_template(self, project_id: str, template_path: str) -> dict:
+        """Store a new report template inside this project and reset only its report mapping."""
+        source = Path(template_path).expanduser().resolve()
+        if source.suffix.lower() not in {".docx", ".docm"} or not source.is_file():
+            raise ValueError("模板必须是存在的 .docx 或 .docm 文件")
+
+        root = self.project_root(project_id)
+        destination = root / "templates" / source.name
+        if source != destination.resolve():
+            shutil.copy2(source, destination)
+
+        with connect(self.db_path(project_id)) as db:
+            db.execute(
+                "UPDATE project SET template_relative_path=?",
+                (destination.relative_to(root).as_posix(),),
+            )
+            # These rows describe the old template's layout. Historical report
+            # runs remain intact, while the next analysis starts from the new one.
+            db.execute("DELETE FROM report_slot_candidates")
+            db.execute("DELETE FROM report_slot_selections")
+            db.execute("DELETE FROM report_slots")
+
+        return {"template_name": destination.name}
 
     def start_index(self, project_id: str) -> dict:
         root = self.project_root(project_id)
@@ -202,9 +237,10 @@ class ProjectService:
             if estimate > self.settings.token_budget:
                 raise ValueError(f"预计 {estimate} Token，超过当前项目 {self.settings.token_budget} Token 预算")
             job_id = str(uuid.uuid4())
+            slot_count = int(db.execute("SELECT COUNT(*) FROM checklist_slots").fetchone()[0])
             db.execute(
                 "INSERT INTO jobs VALUES (?, 'index', 'queued', 0, ?, '等待开始', ?, 0, ?, ?)",
-                (job_id, len(photos), estimate, utcnow(), utcnow()),
+                (job_id, len(photos) + slot_count, estimate, utcnow(), utcnow()),
             )
         thread = threading.Thread(target=self._index_worker, args=(project_id, job_id), daemon=True)
         self._jobs[job_id] = thread
@@ -258,13 +294,24 @@ class ProjectService:
                         )
                 self._copy_exact_duplicate_vectors(project_id)
                 with connect(self.db_path(project_id)) as db:
-                    db.execute("UPDATE jobs SET message='正在按照清单自动匹配推荐候选照片...', updated_at=? WHERE id=?", (utcnow(), job_id))
+                    db.execute("UPDATE jobs SET message='开始按清单匹配候选照片', updated_at=? WHERE id=?", (utcnow(), job_id))
                     slots = db.execute("SELECT id, label FROM checklist_slots ORDER BY ordinal").fetchall()
-                for slot in slots:
+                for ordinal, slot in enumerate(slots, start=1):
                     try:
                         self._compute_candidates(project_id, slot["id"], slot["label"], 8)
                     except Exception:
                         pass
+                    with connect(self.db_path(project_id)) as db:
+                        db.execute(
+                            "UPDATE jobs SET current=?, total=?, message=?, updated_at=? WHERE id=?",
+                            (
+                                len(rows) + ordinal,
+                                len(rows) + len(slots),
+                                f"正在匹配清单 {ordinal}/{len(slots)}：{slot['label']}",
+                                utcnow(),
+                                job_id,
+                            ),
+                        )
                 with connect(self.db_path(project_id)) as db:
                     db.execute("UPDATE jobs SET status='completed', message='图片向量化与清单匹配已全部完成', updated_at=? WHERE id=?", (utcnow(), job_id))
                     db.execute("UPDATE project SET status='indexed'")
@@ -505,6 +552,18 @@ class ProjectService:
                     "INSERT INTO candidates VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (slot_id, row["id"], semantic_score, row["quality_score"], total, rank, utcnow()),
                 )
+            # The user requested automatic selection for the same threshold shown as “高置信度” in the UI.
+            if ranked and ranked[0][0] >= AUTO_CONFIRM_THRESHOLD:
+                existing = db.execute("SELECT 1 FROM confirmations WHERE slot_id=?", (slot_id,)).fetchone()
+                rejected = db.execute(
+                    "SELECT 1 FROM rejections WHERE slot_id=? AND photo_id=?",
+                    (slot_id, ranked[0][2]["id"]),
+                ).fetchone()
+                if not existing and not rejected:
+                    db.execute(
+                        "INSERT INTO confirmations VALUES (?, ?, ?)",
+                        (slot_id, ranked[0][2]["id"], utcnow()),
+                    )
 
     def search(self, project_id: str, query: str, top_k: int) -> list[dict]:
         query_vector = self._query_vector(project_id, query)
@@ -548,6 +607,31 @@ class ProjectService:
                     }
                 )
         return result
+
+    def confirm_all_top_candidates(self, project_id: str) -> dict:
+        """Confirm rank-1 candidates for unconfirmed slots without overwriting human choices."""
+        self.project_root(project_id)
+        with connect(self.db_path(project_id)) as db:
+            rows = db.execute(
+                """SELECT s.id AS slot_id, c.photo_id
+                   FROM checklist_slots s
+                   JOIN candidates c ON c.slot_id=s.id AND c.rank=1
+                   WHERE NOT EXISTS (SELECT 1 FROM confirmations x WHERE x.slot_id=s.id)
+                     AND NOT EXISTS (SELECT 1 FROM rejections r WHERE r.slot_id=s.id AND r.photo_id=c.photo_id)
+                   ORDER BY s.ordinal"""
+            ).fetchall()
+            pending = int(db.execute(
+                "SELECT COUNT(*) FROM checklist_slots s WHERE NOT EXISTS (SELECT 1 FROM confirmations x WHERE x.slot_id=s.id)"
+            ).fetchone()[0])
+            total = int(db.execute("SELECT COUNT(*) FROM checklist_slots").fetchone()[0])
+        for row in rows:
+            self.confirm(project_id, row["slot_id"], [row["photo_id"]])
+        return {
+            "selected_count": len(rows),
+            "skipped_confirmed_count": total - pending,
+            "unmatched_count": max(0, pending - len(rows)),
+            "message": f"已为 {len(rows)} 个未确认清单项选中最高匹配照片",
+        }
 
     def confirm(self, project_id: str, slot_id: str, photo_ids: list[str]) -> None:
         root = self.project_root(project_id)
@@ -617,7 +701,9 @@ class ProjectService:
                     )
                     if options and options[0][0] <= 8:
                         distance, nearest = options[0]
-                slot_id = self._context_slot(item.context_text, slots)
+                slot_id, mapping_score = best_checklist_match(
+                    item.context_text, [(slot["id"], slot["label"]) for slot in slots]
+                )
                 confidence = 1.0 if distance == 0 else (max(0.0, 1 - (distance or 99) / 16) if distance is not None else 0.0)
                 if nearest:
                     matched += 1
@@ -635,6 +721,23 @@ class ProjectService:
                         utcnow(),
                     ),
                 )
+                # Only generic field language is copied to the global catalog.
+                # Photo IDs, paths, hashes and supplier-specific report data stay in this project DB.
+                if slot_id and mapping_score >= 0.82 and item.context_text:
+                    label = next(slot["label"] for slot in slots if slot["id"] == slot_id)
+                    with connect(self.settings.global_db) as global_db:
+                        catalog = global_db.execute(
+                            "SELECT aliases_json FROM checklist_catalog WHERE label=?", (label,)
+                        ).fetchone()
+                        aliases = json.loads(catalog["aliases_json"]) if catalog else []
+                        alias = normalize_label(item.context_text)
+                        if alias and len(alias) <= 100 and alias not in aliases:
+                            aliases = (aliases + [alias])[-20:]
+                            global_db.execute(
+                                "INSERT INTO checklist_catalog(label, aliases_json) VALUES (?, ?) "
+                                "ON CONFLICT(label) DO UPDATE SET aliases_json=excluded.aliases",
+                                (label, json.dumps(aliases, ensure_ascii=False)),
+                            )
         return {"media_count": len(media), "matched_count": matched}
 
     @staticmethod
