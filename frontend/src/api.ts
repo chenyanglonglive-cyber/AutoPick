@@ -31,6 +31,21 @@ export type Candidate = {
   quality_flags: string[]
 }
 
+export type GalleryPhoto = {
+  photo_id: string
+  filename: string
+  preview_url: string
+  quality_score: number
+  quality_flags: string[]
+  embedding_status: 'indexed' | 'pending'
+  ocr_status: 'done' | 'pending'
+  ocr_text_preview: string
+  usage_count: number
+  score?: number | null
+  semantic_score?: number | null
+  ocr_hit: boolean
+}
+
 let token = ''
 
 export async function initSession() {
@@ -59,6 +74,9 @@ export const api = {
   index: (projectId: string) => request<any>(`/api/projects/${projectId}/index`, { method: 'POST' }),
   job: (projectId: string, jobId: string) => request<any>(`/api/projects/${projectId}/jobs/${jobId}`),
   checklist: (projectId: string) => request<Slot[]>(`/api/projects/${projectId}/checklist`),
+  gallery: (projectId: string) => request<GalleryPhoto[]>(`/api/projects/${projectId}/gallery`),
+  gallerySearch: (projectId: string, query: string, top_k = 120) => request<GalleryPhoto[]>(`/api/projects/${projectId}/gallery/search`, { method: 'POST', body: JSON.stringify({ query, top_k }) }),
+  ocr: (projectId: string) => request<any>(`/api/projects/${projectId}/ocr`, { method: 'POST' }),
   candidates: (projectId: string, slotId: string) => request<Candidate[]>(`/api/projects/${projectId}/slots/${slotId}/candidates`),
   search: (projectId: string, query: string, top_k = 30) => request<Candidate[]>(`/api/projects/${projectId}/search`, { method: 'POST', body: JSON.stringify({ query, top_k }) }),
   confirm: (projectId: string, slotId: string, photoIds: string[]) => request(`/api/projects/${projectId}/slots/${slotId}/confirm`, { method: 'POST', body: JSON.stringify({ photo_ids: photoIds }) }),

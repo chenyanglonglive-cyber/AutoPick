@@ -73,6 +73,21 @@ class CandidateResponse(BaseModel):
     quality_flags: list[str] = []
 
 
+class GalleryPhotoResponse(BaseModel):
+    photo_id: str
+    filename: str
+    preview_url: str
+    quality_score: float
+    quality_flags: list[str] = []
+    embedding_status: str
+    ocr_status: str
+    ocr_text_preview: str = ""
+    usage_count: int = 0
+    score: float | None = None
+    semantic_score: float | None = None
+    ocr_hit: bool = False
+
+
 class ChecklistSlot(BaseModel):
     id: str
     label: str

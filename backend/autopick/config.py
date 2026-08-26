@@ -15,7 +15,9 @@ class Settings:
     session_token: str
     embedding_dimension: int = 1024
     embedding_model: str = "qwen3-vl-embedding"
+    ocr_model: str = "qwen-vl-ocr"
     token_budget: int = 500_000
+    qwen_max_retries: int = 8
 
     @property
     def global_db(self) -> Path:
@@ -49,4 +51,5 @@ def load_settings() -> Settings:
         dashscope_api_key=os.getenv("DASHSCOPE_API_KEY") or None,
         demo_embeddings=os.getenv("AUTOPICK_DEMO_EMBEDDINGS", "0") == "1",
         session_token=secrets.token_urlsafe(32),
+        qwen_max_retries=max(1, int(os.getenv("AUTOPICK_QWEN_MAX_RETRIES", "8"))),
     )

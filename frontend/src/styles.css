@@ -261,6 +261,36 @@ button.secondary:hover:not(:disabled) {
   font-weight: normal;
 }
 
+.project-nav {
+  display: grid;
+  gap: 6px;
+  margin: 18px 0 4px;
+  padding-top: 14px;
+  border-top: 1px solid #edf1f6;
+}
+
+.project-nav button {
+  background: #f8fafc;
+  color: #27354a;
+  text-align: left;
+  border: 1px solid #eef2f7;
+  padding: 10px;
+}
+
+.project-nav button.active {
+  background: #eaf1ff;
+  border-color: #2166e5;
+  color: #174baf;
+}
+
+.project-nav small {
+  display: block;
+  margin-top: 3px;
+  color: #6f7d92;
+  font-size: 10.5px;
+  font-weight: 500;
+}
+
 /* 2. Slots Panel (照片清单 + 独立滚动 + 置信度标签) */
 .slots-panel {
   border-right: 1px solid #e8ecf4;
@@ -387,6 +417,111 @@ button.secondary:hover:not(:disabled) {
   padding: 20px 24px;
   overflow-y: auto;
   flex: 1;
+}
+
+.gallery-workspace {
+  grid-template-columns: 210px minmax(520px, 1fr) 210px;
+}
+
+.gallery-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.gallery-heading h1 {
+  margin: 0 0 5px;
+  font-size: 22px;
+}
+
+.gallery-search-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.gallery-search-bar input {
+  flex: 1;
+  border: 1px solid #cfd9e8;
+  border-radius: 8px;
+  padding: 10px 12px;
+  outline-color: #2166e5;
+}
+
+.ocr-callout {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 18px;
+  border: 1px solid #b8d3fb;
+  background: #f2f7ff;
+  border-radius: 10px;
+  padding: 11px 13px;
+}
+
+.ocr-callout strong {
+  color: #174baf;
+  font-size: 13px;
+}
+
+.ocr-callout p {
+  margin: 3px 0 0;
+  color: #5d6f89;
+  font-size: 11.5px;
+}
+
+.ocr-callout button {
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.gallery-grid {
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+}
+
+.gallery-card .img-wrapper {
+  height: 158px;
+}
+
+.gallery-status-row {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.status-pill {
+  padding: 2px 6px;
+  border-radius: 99px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.status-pill.indexed, .status-pill.done {
+  color: #087443;
+  background: #dff7eb;
+}
+
+.status-pill.pending {
+  color: #866000;
+  background: #fff3cd;
+}
+
+.ocr-preview {
+  margin: 2px 0 0;
+  color: #50637e;
+  font-size: 10.5px;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.ocr-hit {
+  color: #087443;
+  font-weight: 700;
 }
 
 .slot-heading {

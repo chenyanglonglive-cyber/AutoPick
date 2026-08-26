@@ -68,3 +68,10 @@ def test_qwen_exhaust_retries(monkeypatch):
         with pytest.raises(QwenError, match="Could not reach Qwen embedding API"):
             client.embed_text("hello")
     assert call_count == 3
+
+
+def test_qwen_retry_delay_is_capped(monkeypatch):
+    monkeypatch.setattr("backend.autopick.qwen.random.uniform", lambda *_: 0.1)
+
+    assert QwenEmbeddingClient._retry_delay(1) == 1.1
+    assert QwenEmbeddingClient._retry_delay(8) == 30.1

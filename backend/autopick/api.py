@@ -13,6 +13,7 @@ from backend.autopick.config import Settings, load_settings
 from backend.autopick.reports import ReportService
 from backend.autopick.schemas import (
     CandidateResponse,
+    GalleryPhotoResponse,
     ChecklistSlot,
     ConfirmRequest,
     JobResponse,
@@ -90,6 +91,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/projects/{project_id}/checklist", response_model=list[ChecklistSlot], dependencies=[Depends(require_session)])
     def checklist(project_id: str) -> list[dict]:
         return projects.list_slots(project_id)
+
+    @app.get("/api/projects/{project_id}/gallery", response_model=list[GalleryPhotoResponse], dependencies=[Depends(require_session)])
+    def gallery(project_id: str) -> list[dict]:
+        return projects.list_gallery(project_id)
+
+    @app.post("/api/projects/{project_id}/gallery/search", response_model=list[GalleryPhotoResponse], dependencies=[Depends(require_session)])
+    def search_gallery(project_id: str, payload: SearchRequest) -> list[dict]:
+        return projects.search_gallery(project_id, payload.query, max(payload.top_k, 120))
+
+    @app.post("/api/projects/{project_id}/ocr", response_model=JobResponse, dependencies=[Depends(require_session)])
+    def ocr_project(project_id: str) -> dict:
+        return projects.start_ocr(project_id)
 
     @app.get("/api/projects/{project_id}/slots/{slot_id}/candidates", response_model=list[CandidateResponse], dependencies=[Depends(require_session)])
     def candidates(project_id: str, slot_id: str) -> list[dict]:

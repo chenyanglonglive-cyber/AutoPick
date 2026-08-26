@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sqlite3
 import threading
@@ -27,7 +28,7 @@ from backend.autopick.images import (
     sha256_file,
 )
 from backend.autopick.history import extract_history_media
-from backend.autopick.qwen import QwenEmbeddingClient
+from backend.autopick.qwen import QwenEmbeddingClient, QwenOcrClient
 
 
 def utcnow() -> str:
@@ -217,6 +218,7 @@ class ProjectService:
             self.settings.embedding_model,
             self.settings.embedding_dimension,
             self.settings.demo_embeddings,
+            max_retries=self.settings.qwen_max_retries,
         ) as client:
             try:
                 with connect(self.db_path(project_id)) as db:
@@ -281,6 +283,56 @@ class ProjectService:
                         (row["id"], source["model"], source["dimension"], source["preprocess_version"], source["vector"], 0, utcnow()),
                     )
 
+    def start_ocr(self, project_id: str) -> dict:
+        """Recognize gallery text only after the user explicitly requests it."""
+        root = self.project_root(project_id)
+        with connect(self.db_path(project_id)) as db:
+            running = db.execute("SELECT * FROM jobs WHERE kind='ocr' AND status='running' ORDER BY created_at DESC LIMIT 1").fetchone()
+            if running:
+                return self._job_dict(running, project_id)
+            photos = db.execute(
+                "SELECT p.* FROM photos p LEFT JOIN ocr_results o ON o.photo_id=p.id WHERE o.photo_id IS NULL"
+            ).fetchall()
+            job_id = str(uuid.uuid4())
+            db.execute(
+                "INSERT INTO jobs VALUES (?, 'ocr', 'queued', 0, ?, '等待开始文字识别', 0, 0, ?, ?)",
+                (job_id, len(photos), utcnow(), utcnow()),
+            )
+        thread = threading.Thread(target=self._ocr_worker, args=(project_id, job_id), daemon=True)
+        self._jobs[job_id] = thread
+        thread.start()
+        return self.get_job(project_id, job_id)
+
+    def _ocr_worker(self, project_id: str, job_id: str) -> None:
+        root = self.project_root(project_id)
+        client = QwenOcrClient(self.settings.dashscope_api_key, self.settings.ocr_model, self.settings.demo_embeddings)
+        try:
+            with connect(self.db_path(project_id)) as db:
+                db.execute("UPDATE jobs SET status='running', message='正在识别图库中的文字', updated_at=? WHERE id=?", (utcnow(), job_id))
+                rows = db.execute(
+                    "SELECT p.* FROM photos p LEFT JOIN ocr_results o ON o.photo_id=p.id WHERE o.photo_id IS NULL ORDER BY p.created_at"
+                ).fetchall()
+            for ordinal, row in enumerate(rows, start=1):
+                original = self.safe_photo_path(project_id, row["id"])
+                derivative = root / "derived" / "ocr" / f"{row['id']}.jpg"
+                make_derivative(original, derivative, 1600, 90)
+                result = client.extract_text(derivative)
+                with connect(self.db_path(project_id)) as db:
+                    db.execute("INSERT OR REPLACE INTO ocr_results VALUES (?, ?, ?)", (row["id"], result.text, utcnow()))
+                    db.execute(
+                        "INSERT INTO api_usage VALUES (?, ?, ?, 'image_ocr', ?, ?, 'success', NULL, ?)",
+                        (str(uuid.uuid4()), job_id, row["id"], self.settings.ocr_model, result.input_tokens, utcnow()),
+                    )
+                    db.execute(
+                        "UPDATE jobs SET current=?, actual_tokens=actual_tokens+?, message=?, updated_at=? WHERE id=?",
+                        (ordinal, result.input_tokens, f"已识别 {ordinal}/{len(rows)} 张图片中的文字", utcnow(), job_id),
+                    )
+            with connect(self.db_path(project_id)) as db:
+                db.execute("UPDATE jobs SET status='completed', message='图库文字识别已完成', updated_at=? WHERE id=?", (utcnow(), job_id))
+        except Exception as exc:
+            with connect(self.db_path(project_id)) as db:
+                db.execute("UPDATE jobs SET status='failed', message=?, updated_at=? WHERE id=?", (str(exc)[:1000], utcnow(), job_id))
+
     def get_job(self, project_id: str, job_id: str) -> dict:
         with connect(self.db_path(project_id)) as db:
             row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -306,6 +358,86 @@ class ProjectService:
                 result.append({**dict(row), "confirmed_photo_ids": [value["photo_id"] for value in confirmed]})
             return result
 
+    def list_gallery(self, project_id: str) -> list[dict]:
+        with connect(self.db_path(project_id)) as db:
+            rows = db.execute(
+                """SELECT p.*, e.photo_id AS embedding_id, o.text AS ocr_text,
+                          (SELECT COUNT(*) FROM confirmations c WHERE c.photo_id=p.id) AS usage_count
+                   FROM photos p
+                   LEFT JOIN embeddings e ON e.photo_id=p.id AND e.model=? AND e.dimension=?
+                   LEFT JOIN ocr_results o ON o.photo_id=p.id
+                   ORDER BY p.created_at, p.source_filename""",
+                (self.settings.embedding_model, self.settings.embedding_dimension),
+            ).fetchall()
+        return [self._present_gallery_photo(project_id, row) for row in rows]
+
+    @staticmethod
+    def _ocr_match_score(query: str, text: str) -> float:
+        normalized_query = "".join(query.lower().split())
+        normalized_text = "".join(text.lower().split())
+        if not normalized_query or not normalized_text:
+            return 0.0
+        if normalized_query in normalized_text:
+            return 1.0
+        tokens = re.findall(r"[a-z0-9][a-z0-9._-]{1,}|[\u4e00-\u9fff]{2,}", normalized_query)
+        if not tokens:
+            return 0.0
+        hits = sum(token in normalized_text for token in tokens)
+        return hits / len(tokens)
+
+    def search_gallery(self, project_id: str, query: str, top_k: int = 120) -> list[dict]:
+        self.project_root(project_id)
+        with connect(self.db_path(project_id)) as db:
+            rows = db.execute(
+                """SELECT p.*, e.vector, e.photo_id AS embedding_id, o.text AS ocr_text,
+                          (SELECT COUNT(*) FROM confirmations c WHERE c.photo_id=p.id) AS usage_count
+                   FROM photos p
+                   LEFT JOIN embeddings e ON e.photo_id=p.id AND e.model=? AND e.dimension=?
+                   LEFT JOIN ocr_results o ON o.photo_id=p.id""",
+                (self.settings.embedding_model, self.settings.embedding_dimension),
+            ).fetchall()
+        vector_rows = [row for row in rows if row["vector"] is not None]
+        semantic: dict[str, float] = {}
+        if vector_rows:
+            query_vector = self._query_vector(project_id, query)
+            matrix = np.vstack([np.frombuffer(row["vector"], dtype=np.float32) for row in vector_rows])
+            semantic = {row["id"]: float(score) for row, score in zip(vector_rows, matrix @ query_vector)}
+        ranked: list[tuple[float, sqlite3.Row, float, bool]] = []
+        for row in rows:
+            ocr_score = self._ocr_match_score(query, row["ocr_text"] or "")
+            semantic_score = semantic.get(row["id"], -1.0)
+            if semantic_score < -0.99 and not ocr_score:
+                continue
+            total = semantic_score + 0.02 * float(row["quality_score"])
+            if ocr_score:
+                total += 1.2 + 0.25 * ocr_score
+            ranked.append((total, row, semantic_score, bool(ocr_score)))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [
+            self._present_gallery_photo(project_id, row, score=score, semantic_score=semantic_score, ocr_hit=ocr_hit)
+            for score, row, semantic_score, ocr_hit in ranked[:top_k]
+        ]
+
+    def _present_gallery_photo(
+        self, project_id: str, row: sqlite3.Row, score: float | None = None,
+        semantic_score: float | None = None, ocr_hit: bool = False,
+    ) -> dict:
+        text = row["ocr_text"] or ""
+        return {
+            "photo_id": row["id"],
+            "filename": row["source_filename"],
+            "preview_url": f"/api/projects/{project_id}/photos/{row['id']}/file",
+            "quality_score": round(float(row["quality_score"]), 4),
+            "quality_flags": json.loads(row["quality_flags_json"]),
+            "embedding_status": "indexed" if row["embedding_id"] else "pending",
+            "ocr_status": "done" if row["ocr_text"] is not None else "pending",
+            "ocr_text_preview": text[:240],
+            "usage_count": int(row["usage_count"]),
+            "score": round(float(score), 4) if score is not None else None,
+            "semantic_score": round(float(semantic_score), 4) if semantic_score is not None else None,
+            "ocr_hit": ocr_hit,
+        }
+
     def candidates(self, project_id: str, slot_id: str, top_k: int = 8) -> list[dict]:
         with connect(self.db_path(project_id)) as db:
             slot = db.execute("SELECT * FROM checklist_slots WHERE id=?", (slot_id,)).fetchone()
@@ -329,6 +461,7 @@ class ProjectService:
             self.settings.embedding_model,
             self.settings.embedding_dimension,
             self.settings.demo_embeddings,
+            max_retries=self.settings.qwen_max_retries,
         ) as client:
             result = client.embed_text(query)
         with connect(self.db_path(project_id)) as db:

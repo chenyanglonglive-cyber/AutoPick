@@ -49,7 +49,7 @@ flowchart TD
 - **解决大规模图片向量化时 SSL EOF 断连异常**：
   - **现象**：处理 300+ 张图片时出现 `[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1010)` 导致任务中断。
   - **优化**：在 `backend/autopick/qwen.py` 中构建持久化 `httpx.Client` 长连接池（HTTP Keep-Alive），避免高频重复 TLS 握手。
-  - **容错**：增加**指数退避自动重试机制**（最大 4 次，1s/2s/4s/8s 递增重试），并在网络异常时自动重置/重建客户端连接。
+  - **容错**：增加**指数退避自动重试机制**（默认最多 8 次，单次等待上限 30 秒，总恢复窗口约 90 秒），并在网络异常时自动重置/重建客户端连接；可通过 `AUTOPICK_QWEN_MAX_RETRIES` 调整次数。
 - **完善 UI 交互与视觉规范**：
   - 增加候选图智能置顶机制：已确认照片置顶 #1，首选推荐次之，备选推荐排序展示；
   - 增加高/中/低置信度徽章（`高置信度` / `中置信度` / `低置信度`）；

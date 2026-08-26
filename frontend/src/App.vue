@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { api, initSession, type Candidate, type Project, type Slot } from './api'
+import { api, initSession, type Candidate, type GalleryPhoto, type Project, type Slot } from './api'
 
 const projects = ref<Project[]>([])
 const activeProject = ref<Project | null>(null)
@@ -13,11 +13,15 @@ const error = ref('')
 const message = ref('')
 const loading = ref(false)
 const showCreate = ref(false)
-const previewImage = ref<Candidate | null>(null)
+const previewImage = ref<Candidate | GalleryPhoto | null>(null)
 const form = ref({ factory_name: '', gallery_path: '', template_path: '', checklist_path: '', history_report_path: '' })
 const job = ref<any>(null)
 const bookmark = ref('')
 const bookmarks = ref<string[]>([])
+const activeView = ref<'checklist' | 'gallery'>('checklist')
+const galleryPhotos = ref<GalleryPhoto[]>([])
+const galleryResults = ref<GalleryPhoto[]>([])
+const galleryQuery = ref('')
 
 type DesktopApi = {
   select_folder: () => Promise<string | null>
@@ -96,7 +100,11 @@ function imageUrl(photoId: string) {
 
 async function refreshProjects() {
   projects.value = await api.projects()
-  if (!activeProject.value && projects.value.length) await openProject(projects.value[0])
+  if (activeProject.value) {
+    activeProject.value = projects.value.find(project => project.id === activeProject.value?.id) || null
+  } else if (projects.value.length) {
+    await openProject(projects.value[0])
+  }
 }
 
 async function openProject(project: Project) {
@@ -105,14 +113,53 @@ async function openProject(project: Project) {
   bookmarks.value = (await api.bookmarks(project.id)).bookmarks
   activeSlot.value = slots.value[0] || null
   if (activeSlot.value) await selectSlot(activeSlot.value)
+  if (activeView.value === 'gallery') await openGallery()
 }
 
 async function selectSlot(slot: Slot) {
+  activeView.value = 'checklist'
   activeSlot.value = slot
   searchResults.value = []
   searchText.value = ''
   candidates.value = await api.candidates(activeProject.value!.id, slot.id)
   bookmark.value = slot.bookmark || ''
+}
+
+const displayedGallery = computed(() => galleryResults.value.length ? galleryResults.value : galleryPhotos.value)
+const indexedGalleryCount = computed(() => galleryPhotos.value.filter(photo => photo.embedding_status === 'indexed').length)
+const ocrGalleryCount = computed(() => galleryPhotos.value.filter(photo => photo.ocr_status === 'done').length)
+
+async function openGallery() {
+  if (!activeProject.value) return
+  activeView.value = 'gallery'
+  galleryResults.value = []
+  galleryQuery.value = ''
+  loading.value = true; error.value = ''
+  try { galleryPhotos.value = await api.gallery(activeProject.value.id) }
+  catch (e: any) { error.value = e.message } finally { loading.value = false }
+}
+
+async function searchGallery() {
+  if (!activeProject.value || !galleryQuery.value.trim()) return
+  loading.value = true; error.value = ''
+  try { galleryResults.value = await api.gallerySearch(activeProject.value.id, galleryQuery.value.trim()) }
+  catch (e: any) { error.value = e.message } finally { loading.value = false }
+}
+
+async function startOcr() {
+  if (!activeProject.value) return
+  loading.value = true; error.value = ''
+  try {
+    job.value = await api.ocr(activeProject.value.id)
+    while (job.value.status === 'queued' || job.value.status === 'running') {
+      await new Promise(resolve => setTimeout(resolve, 1000))
+      job.value = await api.job(activeProject.value.id, job.value.id)
+    }
+    if (job.value.status !== 'completed') throw new Error(job.value.message)
+    galleryPhotos.value = await api.gallery(activeProject.value.id)
+    galleryResults.value = []
+    message.value = '图库文字识别已完成，可以按证书编号、文件名或现场标识搜索。'
+  } catch (e: any) { error.value = e.message } finally { loading.value = false }
 }
 
 const currentSlotIndex = computed(() => {
@@ -160,7 +207,10 @@ async function startIndex() {
       }
     }
     message.value = '图片向量化与全清单自动匹配已完成！'
-  } catch (e: any) { error.value = e.message } finally { loading.value = false }
+  } catch (e: any) {
+    error.value = `${e.message}；已完成的向量化进度已保留，请检查网络后重试。`
+    await refreshProjects()
+  } finally { loading.value = false }
 }
 
 async function search() {
@@ -170,7 +220,7 @@ async function search() {
   catch (e: any) { error.value = e.message } finally { loading.value = false }
 }
 
-async function usePhoto(candidate: Candidate) {
+async function usePhoto(candidate: Candidate | GalleryPhoto) {
   if (!activeProject.value || !activeSlot.value) return
   try {
     await api.confirm(activeProject.value.id, activeSlot.value.id, [candidate.photo_id])
@@ -245,12 +295,20 @@ onMounted(async () => { await initSession(); await refreshProjects() })
       <button class="primary-lg" @click="showCreate = true">创建工厂项目</button>
     </section>
 
-    <section v-else class="workspace">
+    <section v-else :class="['workspace', { 'gallery-workspace': activeView === 'gallery' }]">
       <!-- 1. 项目列表面板 -->
       <aside class="projects-panel">
         <p class="eyebrow">当前工厂</p>
         <h2>{{ activeProject.factory_name }}</h2>
         <p class="muted">{{ activeProject.photo_count }} 张图 · {{ activeProject.indexed_count }} 已向量化</p>
+
+        <div class="project-nav" aria-label="项目功能">
+          <button :class="{ active: activeView === 'checklist' }" @click="activeView = 'checklist'">审核清单</button>
+          <button :class="{ active: activeView === 'gallery' }" @click="openGallery">
+            图库
+            <small>{{ activeProject.photo_count }} 张 · {{ activeProject.indexed_count }} 已向量化</small>
+          </button>
+        </div>
 
         <p class="eyebrow mt-16">项目切换</p>
         <div class="project-list">
@@ -267,7 +325,7 @@ onMounted(async () => { await initSession(); await refreshProjects() })
       </aside>
 
       <!-- 2. 照片清单面板 (支持长清单独立垂直滚动 + 置信度标签) -->
-      <aside class="slots-panel">
+      <aside v-if="activeView === 'checklist'" class="slots-panel">
         <div class="slots-header">
           <p class="eyebrow">照片清单 ({{ slots.length }})</p>
           <span class="slots-stats">{{ activeProject.confirmed_count }}/{{ slots.length }} 已确认</span>
@@ -292,6 +350,7 @@ onMounted(async () => { await initSession(); await refreshProjects() })
 
       <!-- 3. 主审阅工作区 (首选/已选放第一位，备选依次排列) -->
       <section class="content-panel">
+        <template v-if="activeView === 'checklist'">
         <div class="slot-heading">
           <div>
             <p class="eyebrow">{{ activeSlot?.section || '现场检查项' }} · 第 {{ currentSlotIndex + 1 }} / {{ slots.length }} 项</p>
@@ -384,6 +443,71 @@ onMounted(async () => { await initSession(); await refreshProjects() })
             </div>
           </article>
         </div>
+        </template>
+
+        <template v-else>
+          <div class="gallery-heading">
+            <div>
+              <p class="eyebrow">当前工厂专属图库</p>
+              <h1>图库浏览</h1>
+              <p class="muted">{{ galleryPhotos.length }} 张照片 · {{ indexedGalleryCount }} 已向量化 · {{ ocrGalleryCount }} 已完成文字识别</p>
+            </div>
+            <button class="secondary" :disabled="loading" @click="openGallery">刷新图库</button>
+          </div>
+
+          <div class="gallery-search-bar">
+            <input
+              v-model="galleryQuery"
+              @keyup.enter="searchGallery"
+              placeholder="搜索画面内容或图片内文字，例如：ISO9001、营业执照、消防栓"
+            />
+            <button :disabled="loading || !galleryQuery.trim()" @click="searchGallery">搜索图库</button>
+            <button v-if="galleryResults.length" class="secondary" @click="galleryResults = []; galleryQuery = ''">显示全部</button>
+          </div>
+
+          <div class="ocr-callout">
+            <div>
+              <strong>图片内文字搜索</strong>
+              <p>OCR 按项目保存且只在本厂图库内检索。未识别照片不会命中文字搜索。</p>
+            </div>
+            <button :disabled="loading || ocrGalleryCount >= galleryPhotos.length" @click="startOcr">
+              {{ ocrGalleryCount >= galleryPhotos.length ? '文字识别已完成' : `识别剩余文字 (${galleryPhotos.length - ocrGalleryCount})` }}
+            </button>
+          </div>
+
+          <div class="section-title-bar">
+            <h3>{{ galleryResults.length ? `“${galleryQuery}” 的搜索结果 (${galleryResults.length})` : `全部图库 (${galleryPhotos.length})` }}</h3>
+            <small class="tip">语义搜索与 OCR 文字命中会同时排序；文字精确命中优先显示。</small>
+          </div>
+
+          <div v-if="!displayedGallery.length" class="no-photos">
+            <p>图库中暂无可显示的照片。</p>
+          </div>
+          <div v-else class="photo-grid gallery-grid">
+            <article v-for="photo in displayedGallery" :key="photo.photo_id" class="photo-card gallery-card">
+              <div class="img-wrapper" @click="previewImage = photo">
+                <img :src="imageUrl(photo.photo_id)" :alt="photo.filename" loading="lazy" />
+                <div class="img-overlay"><span>🔍 点击放大</span></div>
+              </div>
+              <div class="photo-meta">
+                <strong :title="photo.filename">{{ photo.filename }}</strong>
+                <div class="gallery-status-row">
+                  <span :class="['status-pill', photo.embedding_status]">{{ photo.embedding_status === 'indexed' ? '向量已完成' : '待向量化' }}</span>
+                  <span :class="['status-pill', photo.ocr_status]">{{ photo.ocr_status === 'done' ? '文字已识别' : '文字待识别' }}</span>
+                </div>
+                <div class="meta-row">
+                  <span v-if="photo.semantic_score != null">相似度 {{ photo.semantic_score.toFixed(3) }}</span>
+                  <span v-else>清晰度 {{ Math.round(photo.quality_score * 100) }}</span>
+                  <span v-if="photo.ocr_hit" class="ocr-hit">文字命中</span>
+                </div>
+                <p v-if="photo.ocr_text_preview" class="ocr-preview" :title="photo.ocr_text_preview">{{ photo.ocr_text_preview }}</p>
+                <em v-if="photo.quality_flags.length">{{ photo.quality_flags.join(' · ') }}</em>
+                <small v-if="photo.usage_count">已用于 {{ photo.usage_count }} 个报告位置</small>
+                <button v-if="activeSlot" class="btn-use" @click="usePhoto(photo)">选为当前清单照片</button>
+              </div>
+            </article>
+          </div>
+        </template>
       </section>
 
       <!-- 4. 报告导出与隔离检查面板 -->
