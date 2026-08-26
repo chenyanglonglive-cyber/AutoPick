@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image
 
 from backend.autopick.config import Settings
+from backend.autopick.db import connect
 from backend.autopick.services import ProjectService
 
 
@@ -65,3 +67,48 @@ def test_vector_search_and_confirmation_never_cross_projects(tmp_path: Path) -> 
     b_photo = b_results[0]["photo_id"]
     with pytest.raises(ValueError, match="当前项目"):
         service.confirm(a["id"], a_slot["id"], [b_photo])
+
+
+def test_high_confidence_candidate_is_automatically_confirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings(tmp_path / "data", None, True, "test-token")
+    service = ProjectService(settings)
+    gallery = tmp_path / "gallery"; gallery.mkdir()
+    write_image(gallery / "certificate.jpg", (80, 90, 100))
+    template = tmp_path / "template.docm"; make_template(template)
+    project = service.create_project("Factory", str(gallery), str(template), None)
+    slot = service.list_slots(project["id"])[0]
+
+    with connect(service.db_path(project["id"])) as db:
+        photo = db.execute("SELECT id FROM photos LIMIT 1").fetchone()
+        vector = np.zeros(1024, dtype=np.float32); vector[0] = 1.0
+        db.execute(
+            "INSERT INTO embeddings VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (photo["id"], settings.embedding_model, settings.embedding_dimension, "test", vector.tobytes(), 0, "now"),
+        )
+    monkeypatch.setattr(service, "_query_vector", lambda *_: np.r_[1.0, np.zeros(1023, dtype=np.float32)])
+
+    service._compute_candidates(project["id"], slot["id"], slot["label"], 8)
+    assert service.list_slots(project["id"])[0]["confirmed_photo_ids"] == [photo["id"]]
+
+
+def test_confirm_all_top_candidates_preserves_manual_confirmation(tmp_path: Path) -> None:
+    settings = Settings(tmp_path / "data", None, True, "test-token")
+    service = ProjectService(settings)
+    gallery = tmp_path / "gallery"; gallery.mkdir()
+    write_image(gallery / "top.jpg", (80, 90, 100))
+    template = tmp_path / "template.docm"; make_template(template)
+    project = service.create_project("Factory", str(gallery), str(template), None)
+    slots = service.list_slots(project["id"])[:2]
+    with connect(service.db_path(project["id"])) as db:
+        photo_id = db.execute("SELECT id FROM photos LIMIT 1").fetchone()["id"]
+        for slot in slots:
+            db.execute(
+                "INSERT INTO candidates VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (slot["id"], photo_id, 0.8, 1.0, 0.58, 1, "now"),
+            )
+    service.confirm(project["id"], slots[0]["id"], [photo_id])
+
+    result = service.confirm_all_top_candidates(project["id"])
+    assert result["selected_count"] == 1
+    assert result["skipped_confirmed_count"] == 1
+    assert service.list_slots(project["id"])[1]["confirmed_photo_ids"] == [photo_id]
