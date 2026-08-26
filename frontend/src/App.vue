@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { api, initSession, type Candidate, type GalleryPhoto, type Project, type Slot } from './api'
+import { api, initSession, type Candidate, type GalleryPhoto, type Project, type ReportCoverage, type Slot } from './api'
 
 const projects = ref<Project[]>([])
 const activeProject = ref<Project | null>(null)
@@ -14,10 +14,9 @@ const message = ref('')
 const loading = ref(false)
 const showCreate = ref(false)
 const previewImage = ref<Candidate | GalleryPhoto | null>(null)
-const form = ref({ factory_name: '', gallery_path: '', template_path: '', checklist_path: '', history_report_path: '' })
+const form = ref({ factory_name: '', gallery_path: '', template_path: '', checklist_path: '' })
 const job = ref<any>(null)
-const bookmark = ref('')
-const bookmarks = ref<string[]>([])
+const reportCoverage = ref<ReportCoverage | null>(null)
 const activeView = ref<'checklist' | 'gallery'>('checklist')
 const galleryPhotos = ref<GalleryPhoto[]>([])
 const galleryResults = ref<GalleryPhoto[]>([])
@@ -33,7 +32,7 @@ function desktopApi(): DesktopApi | null {
   return (window as Window & { pywebview?: { api?: DesktopApi } }).pywebview?.api || null
 }
 
-async function choose(kind: 'gallery' | 'template' | 'checklist' | 'history_report') {
+async function choose(kind: 'gallery' | 'template' | 'checklist') {
   const bridge = desktopApi()
   if (!bridge) {
     message.value = '浏览器开发模式请直接输入路径；打包后的桌面版会打开Windows选择窗口。'
@@ -45,12 +44,16 @@ async function choose(kind: 'gallery' | 'template' | 'checklist' | 'history_repo
   if (selected) form.value[`${kind}_path` as keyof typeof form.value] = selected
 }
 
-function confidenceLevel(slot: Slot): 'confirmed' | 'high' | 'medium' | 'low' | 'none' {
-  if (slot.confirmed_photo_ids && slot.confirmed_photo_ids.length > 0) return 'confirmed'
+function matchConfidenceLevel(slot: Slot): 'high' | 'medium' | 'low' | 'none' {
   if (slot.top_score == null) return 'none'
   if (slot.top_score >= 0.35) return 'high'
   if (slot.top_score >= 0.22) return 'medium'
   return 'low'
+}
+
+function confidenceLevel(slot: Slot): 'confirmed' | 'high' | 'medium' | 'low' | 'none' {
+  if (slot.confirmed_photo_ids && slot.confirmed_photo_ids.length > 0) return 'confirmed'
+  return matchConfidenceLevel(slot)
 }
 
 function confidenceText(slot: Slot): string {
@@ -110,7 +113,7 @@ async function refreshProjects() {
 async function openProject(project: Project) {
   activeProject.value = project
   slots.value = await api.checklist(project.id)
-  bookmarks.value = (await api.bookmarks(project.id)).bookmarks
+  reportCoverage.value = await api.reportCoverage(project.id)
   activeSlot.value = slots.value[0] || null
   if (activeSlot.value) await selectSlot(activeSlot.value)
   if (activeView.value === 'gallery') await openGallery()
@@ -122,7 +125,6 @@ async function selectSlot(slot: Slot) {
   searchResults.value = []
   searchText.value = ''
   candidates.value = await api.candidates(activeProject.value!.id, slot.id)
-  bookmark.value = slot.bookmark || ''
 }
 
 const displayedGallery = computed(() => galleryResults.value.length ? galleryResults.value : galleryPhotos.value)
@@ -182,7 +184,7 @@ async function nextSlot() {
 async function createProject() {
   loading.value = true; error.value = ''
   try {
-    const project = await api.createProject({ ...form.value, checklist_path: form.value.checklist_path || undefined, history_report_path: form.value.history_report_path || undefined })
+    const project = await api.createProject({ ...form.value, checklist_path: form.value.checklist_path || undefined })
     await refreshProjects(); await openProject(project)
     showCreate.value = false
     message.value = '项目已创建，图库已冻结为独立快照。'
@@ -235,19 +237,76 @@ async function usePhoto(candidate: Candidate | GalleryPhoto) {
   } catch (e: any) { error.value = e.message }
 }
 
-async function saveBookmark() {
-  if (!activeProject.value || !activeSlot.value || !bookmark.value.trim()) return
+async function confirmAllTop() {
+  if (!activeProject.value) return
+  loading.value = true; error.value = ''
   try {
-    await api.mapBookmark(activeProject.value.id, activeSlot.value.id, bookmark.value.trim())
-    activeSlot.value.bookmark = bookmark.value.trim()
-    message.value = 'Word书签映射已保存。'
-  } catch (e: any) { error.value = e.message }
+    const result = await api.confirmAllTop(activeProject.value.id)
+    projects.value = await api.projects()
+    activeProject.value = projects.value.find(project => project.id === activeProject.value!.id) || activeProject.value
+    slots.value = await api.checklist(activeProject.value.id)
+    activeSlot.value = slots.value.find(slot => slot.id === activeSlot.value?.id) || slots.value[0] || null
+    if (activeSlot.value) await selectSlot(activeSlot.value)
+    message.value = result.message
+  } catch (e: any) { error.value = e.message } finally { loading.value = false }
+}
+
+async function analyzeReportTemplate() {
+  if (!activeProject.value) return
+  loading.value = true; error.value = ''
+  try {
+    const result = await api.analyzeTemplate(activeProject.value.id)
+    reportCoverage.value = await api.reportCoverage(activeProject.value.id)
+    message.value = `已识别 ${result.slot_count} 个报告图片位置，正在按清单检查覆盖关系。`
+  } catch (e: any) { error.value = e.message } finally { loading.value = false }
+}
+
+async function replaceReportTemplate() {
+  if (!activeProject.value) return
+  const bridge = desktopApi()
+  if (!bridge) {
+    error.value = '请在桌面版中选择 Word 模板。'
+    return
+  }
+  const selected = await bridge.select_word_template()
+  if (!selected) return
+
+  loading.value = true; error.value = ''
+  try {
+    const projectId = activeProject.value.id
+    const result = await api.replaceTemplate(projectId, selected)
+    await refreshProjects()
+    const analysis = await api.analyzeTemplate(projectId)
+    reportCoverage.value = await api.reportCoverage(projectId)
+    message.value = `已使用模板“${result.template_name}”，识别到 ${analysis.slot_count} 个图片位置，请重新自动匹配。`
+  } catch (e: any) { error.value = e.message } finally { loading.value = false }
+}
+
+async function matchReport() {
+  if (!activeProject.value) return
+  loading.value = true; error.value = ''
+  try {
+    const result = await api.matchReport(activeProject.value.id)
+    reportCoverage.value = result.coverage
+    message.value = `已自动匹配 ${result.matched_slots}/${result.slot_count} 个报告图片位置。`
+  } catch (e: any) { error.value = e.message } finally { loading.value = false }
+}
+
+async function refreshReportCoverage() {
+  if (!activeProject.value) return
+  loading.value = true; error.value = ''
+  try {
+    reportCoverage.value = await api.preflight(activeProject.value.id)
+    message.value = reportCoverage.value.ready ? '报告预检通过，可以生成正式 Word 报告。' : '报告预检发现缺口，请先查看右侧清单。'
+  } catch (e: any) { error.value = e.message } finally { loading.value = false }
 }
 
 async function generateReport() {
   if (!activeProject.value) return
   loading.value = true; error.value = ''
   try {
+    reportCoverage.value = await api.preflight(activeProject.value.id)
+    if (!reportCoverage.value.ready) throw new Error('报告预检未通过：请先补齐右侧显示的模板位置或清单缺口。')
     const result = await api.generate(activeProject.value.id)
     message.value = `报告已生成：${result.output_path}`
   } catch (e: any) { error.value = e.message } finally { loading.value = false }
@@ -267,7 +326,14 @@ onMounted(async () => { await initSession(); await refreshProjects() })
       <div class="actions">
         <button class="secondary" @click="showCreate = true">新建工厂项目</button>
         <button :disabled="!activeProject || loading" @click="startIndex">
-          {{ loading ? '处理中…' : '建立图片向量' }}
+          {{ loading ? '处理中…' : ((activeProject?.indexed_count ?? 0) >= (activeProject?.photo_count ?? 1) ? '重新匹配清单' : '建立图片向量') }}
+        </button>
+        <button
+          class="export-top"
+          :disabled="!activeProject || loading || !reportCoverage?.ready"
+          @click="generateReport"
+        >
+          导出 Word 报告
         </button>
       </div>
     </header>
@@ -284,7 +350,7 @@ onMounted(async () => { await initSession(); await refreshProjects() })
     <div v-if="job && (job.status === 'running' || job.status === 'queued')" class="job-banner">
       <div class="job-info">
         <strong>{{ job.message }}</strong>
-        <span>{{ job.current }}/{{ job.total }} · {{ job.actual_tokens || 0 }} Token</span>
+        <span>{{ job.current }}/{{ job.total }} · {{ progress }}% · {{ job.actual_tokens || 0 }} Token</span>
       </div>
       <div class="progress"><i :style="{ width: `${progress}%` }"></i></div>
     </div>
@@ -330,11 +396,20 @@ onMounted(async () => { await initSession(); await refreshProjects() })
           <p class="eyebrow">照片清单 ({{ slots.length }})</p>
           <span class="slots-stats">{{ activeProject.confirmed_count }}/{{ slots.length }} 已确认</span>
         </div>
+        <div class="slots-bulk-action">
+          <button class="btn-select-all" :disabled="loading" @click="confirmAllTop">
+            全部选中最高匹配
+          </button>
+          <small>仅补全未确认项，不覆盖人工确认或拒绝项。</small>
+        </div>
         <div class="slots-scroll">
           <button
             v-for="(slot, idx) in slots"
             :key="slot.id"
-            :class="{ active: slot.id === activeSlot?.id, 'is-done': slot.confirmed_photo_ids?.length }"
+            :class="[
+              `confidence-line-${matchConfidenceLevel(slot)}`,
+              { active: slot.id === activeSlot?.id, 'is-done': slot.confirmed_photo_ids?.length }
+            ]"
             @click="selectSlot(slot)"
           >
             <div class="slot-btn-content">
@@ -360,15 +435,6 @@ onMounted(async () => { await initSession(); await refreshProjects() })
             <button class="secondary nav-btn" :disabled="currentSlotIndex <= 0" @click="prevSlot">◀ 上一项</button>
             <button class="secondary nav-btn" :disabled="currentSlotIndex >= slots.length - 1" @click="nextSlot">下一项 ▶</button>
           </div>
-        </div>
-
-        <div class="mapping-bar">
-          <span class="mapping-title">Word 模板书签位置：</span>
-          <input v-model="bookmark" list="template-bookmarks" placeholder="例如 PHOTO_GATE" />
-          <datalist id="template-bookmarks">
-            <option v-for="name in bookmarks" :key="name" :value="name" />
-          </datalist>
-          <button class="secondary" @click="saveBookmark">保存位置</button>
         </div>
 
         <div class="search-bar">
@@ -510,21 +576,21 @@ onMounted(async () => { await initSession(); await refreshProjects() })
         </template>
       </section>
 
-      <!-- 4. 报告导出与隔离检查面板 -->
+      <!-- 4. 报告自动匹配、预检与导出 -->
       <aside class="review-panel">
-        <p class="eyebrow">审核进度</p>
-        <h3 class="stat-count">{{ activeProject.confirmed_count }}/{{ activeProject.slot_count }}</h3>
-        <p class="muted">已确认清单项</p>
+        <p class="eyebrow">报告交付</p>
+        <h3 class="stat-count">{{ reportCoverage?.selected_slots || 0 }}/{{ reportCoverage?.analyzed_slots || 0 }}</h3>
+        <p class="muted">已自动匹配报告位置</p>
 
         <div class="progress-box">
           <div class="progress-bar-wrap">
             <div
               class="progress-bar-fill"
-              :style="{ width: `${activeProject.slot_count ? Math.round((activeProject.confirmed_count / activeProject.slot_count) * 100) : 0}%` }"
+              :style="{ width: `${reportCoverage?.analyzed_slots ? Math.round(((reportCoverage?.selected_slots || 0) / reportCoverage.analyzed_slots) * 100) : 0}%` }"
             ></div>
           </div>
           <span class="progress-text">
-            完成度 {{ activeProject.slot_count ? Math.round((activeProject.confirmed_count / activeProject.slot_count) * 100) : 0 }}%
+            槽位覆盖 {{ reportCoverage?.analyzed_slots ? Math.round(((reportCoverage?.selected_slots || 0) / reportCoverage.analyzed_slots) * 100) : 0 }}%
           </span>
         </div>
 
@@ -533,12 +599,24 @@ onMounted(async () => { await initSession(); await refreshProjects() })
           <p>当前检索与选图严格限制于本厂专属图库与数据库，绝不跨项目串图。</p>
         </div>
 
-        <button
-          class="btn-generate"
-          :disabled="loading || activeProject.confirmed_count < activeProject.slot_count"
-          @click="generateReport"
-        >
-          {{ activeProject.confirmed_count < activeProject.slot_count ? `待确认全部项 (${activeProject.confirmed_count}/${activeProject.slot_count})` : '一键生成 Word 报告' }}
+        <div class="report-actions">
+          <button class="secondary" :disabled="loading" @click="replaceReportTemplate">选择/更换模板</button>
+          <small class="template-hint">当前：{{ activeProject.template_name || '未选择模板' }}</small>
+          <button class="secondary" :disabled="loading" @click="analyzeReportTemplate">1. 分析报告模板</button>
+          <button :disabled="loading || !reportCoverage?.analyzed_slots" @click="matchReport">2. 自动匹配报告图片</button>
+          <button class="secondary" :disabled="loading || !reportCoverage?.analyzed_slots" @click="refreshReportCoverage">3. 检查覆盖与缺口</button>
+        </div>
+
+        <div v-if="reportCoverage" class="coverage-card" :class="{ ready: reportCoverage.ready }">
+          <strong>{{ reportCoverage.ready ? '✓ 报告预检通过' : '⚠ 需要处理的缺口' }}</strong>
+          <p>未映射清单 {{ reportCoverage.unmapped_checklist.length }} 项 · 未映射报告位置 {{ reportCoverage.unmapped_report_slots.length }} 项 · 缺图 {{ reportCoverage.missing_images.length }} 项 · 风险 {{ reportCoverage.risks.length }} 项</p>
+          <small v-if="reportCoverage.unmapped_checklist.length">例如：{{ reportCoverage.unmapped_checklist.slice(0, 2).map(item => item.label).join('、') }}</small>
+          <small v-else-if="reportCoverage.unmapped_report_slots.length">例如：{{ reportCoverage.unmapped_report_slots.slice(0, 2).map(item => item.caption).join('、') }}</small>
+          <small v-else-if="reportCoverage.risks.length">低置信度或质量风险会随 Manifest 一并记录。</small>
+        </div>
+
+        <button class="btn-generate" :disabled="loading || !reportCoverage?.ready" @click="generateReport">
+          {{ reportCoverage?.ready ? '4. 生成 Word 报告' : '预检未通过，不能导出' }}
         </button>
       </aside>
     </section>
@@ -593,13 +671,6 @@ onMounted(async () => { await initSession(); await refreshProjects() })
           <span class="file-input">
             <input v-model="form.checklist_path" placeholder="D:\\AutoPick\\Photo report list.docx" />
             <button type="button" class="secondary" @click="choose('checklist')">浏览</button>
-          </span>
-        </label>
-        <label>
-          历史报告学习（可选往期 .docm 案例）
-          <span class="file-input">
-            <input v-model="form.history_report_path" placeholder="D:\\Report\\previous-audit.docm" />
-            <button type="button" class="secondary" @click="choose('history_report')">浏览</button>
           </span>
         </label>
         <p class="modal-tip">

@@ -104,6 +104,14 @@ button.secondary:hover:not(:disabled) {
   gap: 10px;
 }
 
+.export-top {
+  background: #107c41;
+}
+
+.export-top:hover:not(:disabled) {
+  background: #0d6334;
+}
+
 /* Notices & Jobs */
 .notice {
   margin: 10px 20px 0;
@@ -348,8 +356,20 @@ button.secondary:hover:not(:disabled) {
   font-weight: 700;
 }
 
-.slots-scroll button.is-done {
-  border-left: 3px solid #107c41;
+.slots-scroll button.confidence-line-high {
+  border-left: 3px solid #16a34a;
+}
+
+.slots-scroll button.confidence-line-medium {
+  border-left: 3px solid #2563eb;
+}
+
+.slots-scroll button.confidence-line-low {
+  border-left: 3px solid #dc2626;
+}
+
+.slots-scroll button.confidence-line-none {
+  border-left: 3px solid #94a3b8;
 }
 
 .slot-btn-content {
@@ -417,6 +437,34 @@ button.secondary:hover:not(:disabled) {
   padding: 20px 24px;
   overflow-y: auto;
   flex: 1;
+}
+
+.slots-bulk-action {
+  padding: 9px 10px 8px;
+  border-bottom: 1px solid #eef2f7;
+  background: #fff;
+}
+
+.slots-bulk-action .btn-select-all {
+  margin: 0;
+}
+
+.slots-bulk-action small {
+  display: block;
+  margin: 5px 1px 0;
+  color: #728197;
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.template-hint {
+  display: block;
+  margin: -3px 2px 7px;
+  color: #728197;
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .gallery-workspace {
@@ -837,6 +885,51 @@ button.secondary:hover:not(:disabled) {
 .btn-generate:hover:not(:disabled) {
   background: #0d6334;
 }
+
+.report-actions {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.report-actions button {
+  width: 100%;
+  font-size: 12px;
+  padding: 9px 10px;
+}
+
+.coverage-card {
+  border: 1px solid #f7c66a;
+  background: #fff8e8;
+  border-radius: 8px;
+  padding: 10px;
+  margin: 10px 0 14px;
+}
+
+.coverage-card.ready {
+  border-color: #a3e8c7;
+  background: #f0fdf4;
+}
+
+.coverage-card strong,
+.coverage-card p,
+.coverage-card small {
+  display: block;
+}
+
+.coverage-card strong { font-size: 12px; color: #8a4b00; }
+.coverage-card.ready strong { color: #107c41; }
+.coverage-card p { margin: 5px 0; font-size: 11px; line-height: 1.45; color: #4d5b70; }
+.coverage-card small { color: #8a4b00; font-size: 10.5px; line-height: 1.35; }
+
+.btn-select-all {
+  width: 100%;
+  padding: 10px 12px;
+  background: #2166e5;
+  font-size: 12.5px;
+  margin: 4px 0 5px;
+}
+
 
 /* Empty State */
 .empty-state {

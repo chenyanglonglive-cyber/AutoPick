@@ -7,6 +7,7 @@ export type Project = {
   indexed_count: number
   confirmed_count: number
   slot_count: number
+  template_name: string
 }
 
 export type Slot = {
@@ -46,6 +47,17 @@ export type GalleryPhoto = {
   ocr_hit: boolean
 }
 
+export type ReportCoverage = {
+  analyzed_slots: number
+  selected_slots: number
+  unmapped_checklist: { id: string; label: string }[]
+  unmapped_report_slots: { id: string; caption: string; mapping_confidence: number }[]
+  missing_images: { id: string; caption: string }[]
+  risks: { id: string; caption: string; confidence: number; quality_flags: string[] }[]
+  ready: boolean
+  template_error?: string
+}
+
 let token = ''
 
 export async function initSession() {
@@ -61,10 +73,28 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
     headers: { 'Content-Type': 'application/json', 'X-AutoPick-Token': token, ...(options.headers || {}) },
   })
   if (!response.ok) {
-    const body = await response.json().catch(() => ({ detail: response.statusText }))
-    throw new Error(body.detail || '请求失败')
+    const body: unknown = await response.json().catch(() => null)
+    throw new Error(formatApiError(body, response.statusText || `HTTP ${response.status}`))
   }
   return response.json() as Promise<T>
+}
+
+function formatApiError(body: unknown, fallback: string): string {
+  if (!body || typeof body !== 'object') return fallback || '请求失败'
+  const detail = (body as { detail?: unknown }).detail
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    const messages = detail.map(item => {
+      if (!item || typeof item !== 'object') return String(item)
+      const error = item as { loc?: unknown[]; msg?: unknown }
+      const field = Array.isArray(error.loc) ? error.loc.at(-1) : null
+      const message = typeof error.msg === 'string' ? error.msg : JSON.stringify(item)
+      return field ? `${String(field)}：${message}` : message
+    }).filter(Boolean)
+    if (messages.length) return `请求参数有误：${messages.join('；')}`
+  }
+  if (detail && typeof detail === 'object') return JSON.stringify(detail)
+  return fallback || '请求失败'
 }
 
 export const api = {
@@ -80,8 +110,12 @@ export const api = {
   candidates: (projectId: string, slotId: string) => request<Candidate[]>(`/api/projects/${projectId}/slots/${slotId}/candidates`),
   search: (projectId: string, query: string, top_k = 30) => request<Candidate[]>(`/api/projects/${projectId}/search`, { method: 'POST', body: JSON.stringify({ query, top_k }) }),
   confirm: (projectId: string, slotId: string, photoIds: string[]) => request(`/api/projects/${projectId}/slots/${slotId}/confirm`, { method: 'POST', body: JSON.stringify({ photo_ids: photoIds }) }),
-  mapBookmark: (projectId: string, slotId: string, bookmark: string) => request(`/api/projects/${projectId}/template/map`, { method: 'POST', body: JSON.stringify({ slot_id: slotId, bookmark }) }),
-  bookmarks: (projectId: string) => request<{ bookmarks: string[] }>(`/api/projects/${projectId}/template/bookmarks`),
+  confirmAllTop: (projectId: string) => request<{ selected_count: number; skipped_confirmed_count: number; unmatched_count: number; message: string }>(`/api/projects/${projectId}/slots/confirm-top`, { method: 'POST' }),
+  analyzeTemplate: (projectId: string) => request<{ template: string; fingerprint: string; slot_count: number }>(`/api/projects/${projectId}/template/analyze`, { method: 'POST' }),
+  replaceTemplate: (projectId: string, templatePath: string) => request<{ template_name: string }>(`/api/projects/${projectId}/template/replace`, { method: 'POST', body: JSON.stringify({ template_path: templatePath }) }),
+  matchReport: (projectId: string) => request<{ matched_slots: number; slot_count: number; coverage: ReportCoverage }>(`/api/projects/${projectId}/report/match`, { method: 'POST' }),
+  reportCoverage: (projectId: string) => request<ReportCoverage>(`/api/projects/${projectId}/report/coverage`),
+  preflight: (projectId: string) => request<ReportCoverage>(`/api/projects/${projectId}/report/preflight`, { method: 'POST' }),
   generate: (projectId: string) => request<any>(`/api/projects/${projectId}/report/generate`, { method: 'POST' }),
   imageUrl: (projectId: string, photoId: string) => `/api/projects/${projectId}/photos/${photoId}/file?token=${encodeURIComponent(token)}`,
 }
