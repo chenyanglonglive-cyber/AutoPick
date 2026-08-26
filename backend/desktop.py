@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 import socket
@@ -8,15 +9,16 @@ from urllib.request import urlopen
 
 import uvicorn
 
-from backend.autopick.api import create_app
+from backend.autopick.api import API_VERSION, create_app
 
 
 def _existing_autopick_url() -> str | None:
-    """Reuse the local service when a second desktop window is opened."""
+    """Reuse only a local service that exposes the same UI API contract."""
     url = "http://127.0.0.1:8787"
     try:
         with urlopen(f"{url}/api/health", timeout=0.5) as response:
-            if response.status == 200:
+            payload = json.load(response)
+            if response.status == 200 and payload.get("api_version") == API_VERSION:
                 return url
     except (URLError, OSError):
         return None

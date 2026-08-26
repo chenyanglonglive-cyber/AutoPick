@@ -62,6 +62,7 @@ build/
 
 # Temp / Reports / Local Data
 test-tmp/
+test-tmp-gallery/
 Report/
 collection/
 AutoPickData/
