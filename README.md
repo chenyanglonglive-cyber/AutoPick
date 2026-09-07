@@ -1,27 +1,39 @@
 # AutoPick
 
-本地运行的工厂审核报告选图工具。Vue3 负责图片审核和文字搜图，Python/FastAPI 负责项目隔离、千问向量、图片质量分析和 Word 报告生成。
+AutoPick 是本地运行的工厂审核清单选图工具。当前版本固定使用内置 `quality_v1` Excel 清单：系统为 199 个图片字段匹配图库照片，用户确认后直接导出 `.xlsx`，不再生成 Word 报告。
 
-## 一键启动
+## 启动
 
-- **桌面客户端启动**：双击根目录下的 `AutoPick快捷启动.lnk` 或 `启动AutoPick.bat` 即可一键启动本地服务与 Windows 桌面窗口。
-- **开发热重载模式**：双击 `启动开发模式(Dev).bat` 同时启动后端 API 与前端 Vite 实时开发服务。
-
-## 开发与构建步骤
-
-1. 设置 `DASHSCOPE_API_KEY`（在 `.env` 中已配置）。
+1. 设置 `DASHSCOPE_API_KEY`（也可以设置 `AUTOPICK_DEMO_EMBEDDINGS=1` 进行离线演示）。
 2. 安装 Python 依赖：`python -m pip install -r requirements.txt`。
-3. 安装前端依赖：在 `frontend` 中执行 `npm install`。
-4. 后端：`python -m backend.run`。
-5. 前端：在 `frontend` 中执行 `npm run dev`。
-6. 构建前端静态资源：在 `frontend` 中执行 `npm run build`。
+3. 在 `frontend` 执行 `pnpm install`，开发时执行 `pnpm run dev`。
+4. 后端执行 `python -m backend.run`；生产构建执行 `pnpm run build`。
 
-后端默认只监听 `127.0.0.1:8787`。生产模式由 Python 提供已构建的 Vue 静态文件，并可通过 `python -m backend.desktop` 启动 Windows 桌面壳。
+## 清单与导出
 
-## 桌面打包
+`resources/checklists/quality_v1/Quality list.xlsx` 是随仓库分发的固定模板，启动时会校验 SHA-256。主工作表保留原有两个工作表、合并单元格、列宽和行高；每个字段只插入一张图片，图片位于字段名正上方。输出文件保存在项目的 `outputs/`，命名为 `<工厂名>__quality_v1__<时间>.xlsx`。缺图会留空并在导出提示中显示数量。
 
-运行 `scripts/build_desktop.ps1` 会先构建Vue静态资源，再生成 `dist/AutoPick/AutoPick.exe`。使用 Inno Setup 打开 `installer/AutoPick.iss` 即可制作安装包。安装后的项目数据默认存放在 `%LOCALAPPDATA%/AutoPickData`，不会写入安装目录。
+目前支持 `quality_v1`，类型注册表已预留另外两种固定清单的位置。新增类型时，需要同时提供模板、坐标解析规则和独立偏好配置。
 
-## 数据隔离
+## 数据目录
 
-每个项目拥有自己的 `project.sqlite`、原图快照、派生图、向量、OCR 和报告清单。全局数据库只保存清单、模板映射和不带图片引用的偏好统计。图片搜索接口始终要求项目 ID，并且在读取文件、检索向量和导出报告时重复验证项目归属。
+默认数据目录是开发目录下的 `AutoPickData/`，打包版是 `%LOCALAPPDATA%/AutoPickData/`。每个项目使用稳定 UUID 文件夹：
+
+```text
+projects/<project-uuid>/
+├─ project.sqlite                 # 项目照片、向量、OCR、匹配和确认记录
+├─ project-info.json              # 工厂名、清单类型和目录说明
+├─ originals/<photo_id>__<name>   # 项目自己的原图副本
+├─ derived/embedding/             # 向量化用派生图
+├─ derived/ocr/                   # OCR 用派生图
+├─ templates/quality_v1.xlsx      # 项目使用的只读清单副本
+└─ outputs/                       # 导出的 Excel 清单
+```
+
+向量实际保存在 `project.sqlite` 的 `embeddings` 表中，通过 `photo_id` 与照片关联。清空当前项目图库只删除项目副本、派生图、向量、OCR、候选和未汇总反馈，不访问外部源图库，也不删除清单模板、Excel 输出或已汇总的别名/偏好。
+
+别名来自用户在某个字段中实际使用的搜索词，导出前集中确认后写入本机全局数据库。每次导出会保存字段、系统推荐和最终选图的快照；导入用户修改后的 Excel 时，保留图片记为正确，删除图片记为错误。当前版本只积累这些反馈，仍使用固定的默认匹配规则；后续训练并通过验证的模型才会影响重新匹配。反馈数据仅保存在用户本机，不随 GitHub 仓库分发。
+
+## 隐私
+
+启用真实千问服务时，只有图片和清单文字的向量化会发送到配置的 DashScope/Qwen 接口。图库文字由 RapidOCR 的本地 ONNX 模型识别，不会因 OCR 上传图片；原图、向量、OCR 文本和偏好默认只保存在本机数据目录。OCR 完成后点击“重新匹配清单”，系统会按语义 62%、OCR 文字命中 28%、图片质量 10% 重新排序。

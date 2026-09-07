@@ -10,22 +10,21 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.autopick.config import Settings, load_settings
-from backend.autopick.reports import ReportService
 from backend.autopick.schemas import (
     CandidateResponse,
     GalleryPhotoResponse,
     ChecklistSlot,
     ConfirmRequest,
+    FeedbackImportRequest,
     JobResponse,
     ProjectCreate,
+    ProjectDeleteRequest,
     ProjectSummary,
     RejectRequest,
-    ReportResponse,
     SearchRequest,
-    TemplateReplaceRequest,
-    HistoryImportRequest,
 )
 from backend.autopick.services import ProjectNotFoundError, ProjectService
+from backend.autopick.excel_checklist import type_payload
 
 
 API_VERSION = "2026-08-26"
@@ -34,7 +33,6 @@ API_VERSION = "2026-08-26"
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     projects = ProjectService(settings)
-    reports = ReportService(projects)
     app = FastAPI(title="AutoPick", version="0.1.0")
     app.state.settings = settings
     app.state.projects = projects
@@ -67,6 +65,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "qwen_configured": bool(settings.dashscope_api_key),
         }
 
+    @app.get("/api/checklist-types", dependencies=[Depends(require_session)])
+    def checklist_types() -> list[dict]:
+        return type_payload()
+
     @app.get("/api/projects", response_model=list[ProjectSummary], dependencies=[Depends(require_session)])
     def list_projects() -> list[dict]:
         return projects.list_projects()
@@ -75,9 +77,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def create_project(payload: ProjectCreate) -> dict:
         try:
             return projects.create_project(
-                payload.factory_name, payload.gallery_path, payload.template_path,
-                payload.checklist_path, payload.history_report_path,
+                payload.factory_name, payload.gallery_path,
+                checklist_type_id=payload.checklist_type_id,
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/projects/{project_id}", dependencies=[Depends(require_session)])
+    def delete_project(project_id: str, payload: ProjectDeleteRequest) -> dict:
+        try:
+            return projects.delete_project(project_id, payload.factory_name)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -89,6 +98,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def index_project(project_id: str) -> dict:
         try:
             return projects.start_index(project_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/projects/{project_id}/match", response_model=JobResponse, dependencies=[Depends(require_session)])
+    def match_project(project_id: str) -> dict:
+        try:
+            return projects.start_match(project_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -129,7 +145,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/projects/{project_id}/slots/{slot_id}/confirm", dependencies=[Depends(require_session)])
     def confirm(project_id: str, slot_id: str, payload: ConfirmRequest) -> dict:
         try:
-            projects.confirm(project_id, slot_id, payload.photo_ids)
+            projects.confirm(project_id, slot_id, [payload.photo_id], payload.source, payload.search_query)
             return {"status": "confirmed"}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -146,61 +162,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         projects.reject(project_id, slot_id, payload.photo_id, payload.reason)
         return {"status": "rejected"}
 
-    @app.post("/api/projects/{project_id}/template/analyze", dependencies=[Depends(require_session)])
-    def analyze_template(project_id: str) -> dict:
+    @app.get("/api/projects/{project_id}/export/preflight", dependencies=[Depends(require_session)])
+    def export_preflight(project_id: str) -> dict:
+        return projects.export_preflight(project_id)
+
+    @app.post("/api/projects/{project_id}/export", dependencies=[Depends(require_session)])
+    def export_excel(project_id: str, allow_partial: bool = True) -> dict:
         try:
-            return reports.analyze_template(project_id)
+            result = projects.export_excel(project_id, allow_partial=allow_partial)
+            result["download_url"] = f"/api/projects/{project_id}/outputs/{Path(result['output_path']).name}?token={settings.session_token}"
+            return result
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.post("/api/projects/{project_id}/template/replace", dependencies=[Depends(require_session)])
-    def replace_template(project_id: str, payload: TemplateReplaceRequest) -> dict:
+    @app.post("/api/projects/{project_id}/gallery/clear", dependencies=[Depends(require_session)])
+    def clear_gallery(project_id: str, payload: dict) -> dict:
         try:
-            return projects.replace_template(project_id, payload.template_path)
+            return projects.clear_gallery(project_id, str(payload.get("factory_name", "")))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.post("/api/projects/{project_id}/report/match", dependencies=[Depends(require_session)])
-    def match_report(project_id: str) -> dict:
+    @app.post("/api/projects/{project_id}/feedback/import", dependencies=[Depends(require_session)])
+    def import_feedback(project_id: str, payload: FeedbackImportRequest) -> dict:
         try:
-            return reports.auto_match(project_id)
+            return projects.import_excel_feedback(project_id, payload.feedback_path)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.get("/api/projects/{project_id}/report/coverage", dependencies=[Depends(require_session)])
-    def report_coverage(project_id: str) -> dict:
+    @app.post("/api/projects/{project_id}/convert", response_model=ProjectSummary, dependencies=[Depends(require_session)])
+    def convert_project(project_id: str, checklist_type_id: str = "quality_v1") -> dict:
         try:
-            return reports.coverage(project_id)
+            return projects.convert_project(project_id, checklist_type_id)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.post("/api/projects/{project_id}/report/preflight", dependencies=[Depends(require_session)])
-    def report_preflight(project_id: str) -> dict:
-        try:
-            return reports.preflight(project_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.post("/api/projects/{project_id}/history/import", dependencies=[Depends(require_session)])
-    def import_history(project_id: str, payload: HistoryImportRequest) -> dict:
-        try:
-            source = Path(payload.report_path).expanduser().resolve()
-            if not source.is_file():
-                raise ValueError("历史报告文件不存在")
-            root = projects.project_root(project_id)
-            target = root / "history" / source.name
-            if source != target:
-                import shutil
-                shutil.copy2(source, target)
-            return projects.learn_from_report(project_id, target)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.post("/api/projects/{project_id}/report/generate", response_model=ReportResponse, dependencies=[Depends(require_session)])
-    def generate_report(project_id: str) -> dict:
-        try:
-            return reports.generate(project_id)
-        except (ValueError, RuntimeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/projects/{project_id}/photos/{photo_id}/file")
@@ -212,6 +205,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return FileResponse(path)
+
+    @app.get("/api/projects/{project_id}/outputs/{filename}")
+    def output_file(project_id: str, filename: str, token: str):
+        if token != settings.session_token:
+            raise HTTPException(status_code=401, detail="Invalid local session token")
+        if Path(filename).name != filename or not filename.lower().endswith(".xlsx"):
+            raise HTTPException(status_code=404, detail="导出文件不存在")
+        root = projects.project_root(project_id)
+        path = root / "outputs" / filename
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="导出文件不存在")
+        return FileResponse(path, filename=filename, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
     frontend_dist = bundle_root / "frontend" / "dist"

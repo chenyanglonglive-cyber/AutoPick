@@ -39,6 +39,25 @@ def test_project_photo_paths_are_physically_isolated(tmp_path: Path) -> None:
         assert handle_a.read() != handle_b.read()
 
 
+def test_delete_project_removes_only_the_confirmed_project(tmp_path: Path) -> None:
+    settings = Settings(tmp_path / "data", None, True, "test-token")
+    service = ProjectService(settings)
+    gallery_a, gallery_b = tmp_path / "a", tmp_path / "b"
+    gallery_a.mkdir(); gallery_b.mkdir()
+    write_image(gallery_a / "one.jpg", (200, 20, 20))
+    write_image(gallery_b / "two.jpg", (20, 20, 200))
+    first = service.create_project("上海测试1", str(gallery_a), checklist_type_id="quality_v1")
+    second = service.create_project("上海测试1", str(gallery_b), checklist_type_id="quality_v1")
+
+    with pytest.raises(ValueError):
+        service.delete_project(first["id"], "错误项目名")
+    assert service.project_root(first["id"]).exists()
+
+    service.delete_project(first["id"], "上海测试1")
+    assert not (settings.projects_root / first["id"]).exists()
+    assert service.project_root(second["id"]).exists()
+
+
 def test_vector_search_and_confirmation_never_cross_projects(tmp_path: Path) -> None:
     settings = Settings(tmp_path / "data", None, True, "test-token")
     service = ProjectService(settings)

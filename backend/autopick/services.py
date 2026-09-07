@@ -13,8 +13,9 @@ from typing import Iterable
 from xml.etree import ElementTree as ET
 
 import numpy as np
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
-from backend.autopick.checklist import extract_checklist_items, fallback_checklist
 from backend.autopick.config import Settings
 from backend.autopick.db import connect, initialize_global, initialize_project
 from backend.autopick.images import (
@@ -29,10 +30,14 @@ from backend.autopick.images import (
 )
 from backend.autopick.history import extract_history_media
 from backend.autopick.report_layout import best_checklist_match, normalize_label
-from backend.autopick.qwen import QwenEmbeddingClient, QwenOcrClient
+from backend.autopick.local_ocr import LocalOcrClient
+from backend.autopick.qwen import QwenEmbeddingClient
+from backend.autopick.excel_checklist import copy_template, get_checklist_type, export_workbook
 
 
 AUTO_CONFIRM_THRESHOLD = 0.35
+AUTO_CONFIRM_MIN_SEMANTIC = 0.18
+DEFAULT_MATCH_WEIGHTS = {"semantic": 0.62, "quality": 0.10, "ocr": 0.28}
 
 
 def utcnow() -> str:
@@ -60,7 +65,34 @@ class ProjectService:
             raise ProjectNotFoundError(f"Project {project_id} was not found")
         # Schema additions must also reach projects created by earlier versions.
         initialize_project(database)
+        with connect(database) as db:
+            slot_state = db.execute("SELECT COUNT(*) AS count, SUM(CASE WHEN item_key IS NULL THEN 1 ELSE 0 END) AS legacy FROM checklist_slots").fetchone()
+        if int(slot_state["count"] or 0) != 199 or int(slot_state["legacy"] or 0) > 0:
+            self._migrate_fixed_root(root, database, "quality_v1")
         return root
+
+    def _migrate_fixed_root(self, root: Path, database: Path, checklist_type_id: str) -> None:
+        checklist = get_checklist_type(checklist_type_id)
+        destination = root / "templates" / f"{checklist_type_id}.xlsx"
+        copy_template(checklist_type_id, destination)
+        with connect(database) as metadata_db:
+            project_metadata = metadata_db.execute("SELECT id, factory_name, created_at FROM project LIMIT 1").fetchone()
+        if project_metadata:
+            (root / "project-info.json").write_text(json.dumps({
+                "id": project_metadata["id"], "factory_name": project_metadata["factory_name"],
+                "checklist_type_id": checklist_type_id, "created_at": project_metadata["created_at"],
+                "data_layout": "originals/<photo_id>__<source_filename>; derived/embedding/<photo_id>__<source_filename>.jpg; project.sqlite",
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        with connect(database) as db:
+            for table in ("candidates", "confirmations", "rejections", "preference_feedback", "pending_aliases", "report_slot_manifest", "report_slot_selections", "report_slot_candidates", "report_slots", "report_manifest", "report_runs", "history_matches"):
+                db.execute(f"DELETE FROM {table}")
+            db.execute("DELETE FROM checklist_slots")
+            for slot in checklist.slots:
+                db.execute(
+                    "INSERT INTO checklist_slots(id, label, section, ordinal, bookmark, item_key, checklist_type_id, sheet_name, label_cell, image_cell, created_at) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), slot.label, slot.section, slot.ordinal, slot.item_key, checklist_type_id, slot.sheet_name, slot.label_cell, slot.image_cell, utcnow()),
+                )
+            db.execute("UPDATE project SET template_relative_path=?, checklist_relative_path=?, checklist_type_id=?, schema_version=2", (destination.relative_to(root).as_posix(), destination.relative_to(root).as_posix(), checklist_type_id))
 
     def db_path(self, project_id: str) -> Path:
         return self.project_root(project_id) / "project.sqlite"
@@ -69,65 +101,61 @@ class ProjectService:
         self,
         factory_name: str,
         gallery_path: str,
-        template_path: str,
-        checklist_path: str | None,
+        template_path: str | None = None,
+        checklist_path: str | None = None,
         history_report_path: str | None = None,
+        checklist_type_id: str = "quality_v1",
     ) -> dict:
         gallery = Path(gallery_path).expanduser().resolve()
-        template = Path(template_path).expanduser().resolve()
-        checklist = Path(checklist_path).expanduser().resolve() if checklist_path else None
-        history = Path(history_report_path).expanduser().resolve() if history_report_path else None
         if not gallery.is_dir():
             raise ValueError("图库路径不是有效文件夹")
-        if template.suffix.lower() not in {".docx", ".docm"} or not template.is_file():
-            raise ValueError("模板必须是存在的 .docx 或 .docm 文件")
-        if checklist and (not checklist.is_file() or checklist.suffix.lower() != ".docx"):
-            raise ValueError("清单必须是存在的 .docx 文件")
-        if history and (not history.is_file() or history.suffix.lower() not in {".docx", ".docm"}):
-            raise ValueError("历史报告必须是存在的 .docx 或 .docm 文件")
+        checklist = get_checklist_type(checklist_type_id)
+        # A compatibility path for pre-Excel callers. The public API no longer
+        # exposes this argument, but keeping the file available lets old local
+        # projects finish a migration without losing their report metadata.
+        legacy_template = Path(template_path).expanduser().resolve() if template_path else None
+        if legacy_template and (legacy_template.suffix.lower() not in {".docx", ".docm"} or not legacy_template.is_file()):
+            raise ValueError("旧模板必须是存在的 .docx 或 .docm 文件")
 
         project_id = str(uuid.uuid4())
         root = self.settings.projects_root / project_id
-        for child in ("originals", "derived/embedding", "derived/ocr", "derived/report", "templates", "history", "outputs", "manifests"):
+        for child in ("originals", "derived/embedding", "derived/ocr", "templates", "outputs", "manifests"):
             (root / child).mkdir(parents=True, exist_ok=True)
-        copied_template = root / "templates" / template.name
-        shutil.copy2(template, copied_template)
-        copied_checklist: Path | None = None
-        if checklist:
-            copied_checklist = root / "templates" / checklist.name
-            shutil.copy2(checklist, copied_checklist)
-        copied_history: Path | None = None
-        if history:
-            copied_history = root / "history" / history.name
-            shutil.copy2(history, copied_history)
+        copied_checklist = root / "templates" / f"{checklist_type_id}.xlsx"
+        copy_template(checklist_type_id, copied_checklist)
+        copied_template = copied_checklist
+        if legacy_template:
+            copied_template = root / "templates" / legacy_template.name
+            shutil.copy2(legacy_template, copied_template)
+        (root / "project-info.json").write_text(json.dumps({
+            "id": project_id, "factory_name": factory_name.strip(),
+            "checklist_type_id": checklist_type_id, "created_at": utcnow(),
+            "data_layout": "originals/<photo_id>__<source_filename>; derived/embedding/<photo_id>__<source_filename>.jpg; project.sqlite",
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
         initialize_project(root / "project.sqlite")
 
         with connect(root / "project.sqlite") as db:
             db.execute(
-                "INSERT INTO project VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?)",
+                "INSERT INTO project(id, factory_name, created_at, status, template_relative_path, checklist_relative_path, embedding_model, embedding_dimension, preprocess_version, checklist_type_id, schema_version) VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?, 2)",
                 (
                     project_id,
                     factory_name.strip(),
                     utcnow(),
                     copied_template.relative_to(root).as_posix(),
-                    copied_checklist.relative_to(root).as_posix() if copied_checklist else None,
+                    copied_checklist.relative_to(root).as_posix(),
                     self.settings.embedding_model,
                     self.settings.embedding_dimension,
                     PREPROCESS_VERSION,
+                    checklist_type_id,
                 ),
             )
-            items = extract_checklist_items(copied_checklist) if copied_checklist else []
-            if not items:
-                items = fallback_checklist()
-            for ordinal, (label, section) in enumerate(items, start=1):
+            for slot in checklist.slots:
                 db.execute(
-                    "INSERT INTO checklist_slots VALUES (?, ?, ?, ?, NULL, ?)",
-                    (str(uuid.uuid4()), label, section, ordinal, utcnow()),
+                    "INSERT INTO checklist_slots(id, label, section, ordinal, bookmark, item_key, checklist_type_id, sheet_name, label_cell, image_cell, created_at) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), slot.label, slot.section, slot.ordinal, slot.item_key, checklist_type_id, slot.sheet_name, slot.label_cell, slot.image_cell, utcnow()),
                 )
-        self._sync_catalog(items)
+        self._sync_catalog([(slot.label, slot.section) for slot in checklist.slots])
         self.import_gallery(project_id, gallery)
-        if copied_history:
-            self.learn_from_report(project_id, copied_history)
         return self.get_project(project_id)
 
     def _sync_catalog(self, items: Iterable[tuple[str, str | None]]) -> None:
@@ -147,7 +175,7 @@ class ProjectService:
                 inspection = inspect_image(source)
                 existing = known_hashes.get(inspection.sha256)
                 photo_id = str(uuid.uuid4())
-                target_name = f"{photo_id}_{source.name}"
+                target_name = f"{photo_id}__{source.name}"
                 target = root / "originals" / target_name
                 shutil.copy2(source, target)
                 duplicate_of = existing
@@ -199,6 +227,23 @@ class ProjectService:
             **dict(counts),
             "template_name": Path(project["template_relative_path"]).name,
         }
+
+    def delete_project(self, project_id: str, factory_name: str) -> dict:
+        """Delete one explicitly confirmed project, including its local outputs."""
+        root = self.project_root(project_id)
+        with connect(self.db_path(project_id)) as db:
+            project = db.execute("SELECT factory_name FROM project LIMIT 1").fetchone()
+            if not project or project["factory_name"] != factory_name:
+                raise ValueError("请输入当前项目名称确认删除项目")
+            if db.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1").fetchone():
+                raise ValueError("当前项目仍有任务运行，暂不能删除")
+
+        target = root.resolve()
+        expected_parent = self.settings.projects_root.resolve()
+        if target.parent != expected_parent or not target.is_dir():
+            raise ValueError("项目目录校验失败，拒绝删除")
+        shutil.rmtree(target)
+        return {"status": "deleted", "project_id": project_id, "message": f"项目“{factory_name}”已删除"}
 
     def replace_template(self, project_id: str, template_path: str) -> dict:
         """Store a new report template inside this project and reset only its report mapping."""
@@ -264,7 +309,7 @@ class ProjectService:
                     ).fetchall()
                 for ordinal, row in enumerate(rows, start=1):
                     original = self.safe_photo_path(project_id, row["id"])
-                    derivative = root / "derived" / "embedding" / f"{row['id']}.jpg"
+                    derivative = root / "derived" / "embedding" / f"{row['id']}__{row['source_filename']}.jpg"
                     make_derivative(original, derivative, 1024, 82)
                     result = client.embed_image(derivative)
                     with connect(self.db_path(project_id)) as db:
@@ -295,10 +340,13 @@ class ProjectService:
                 self._copy_exact_duplicate_vectors(project_id)
                 with connect(self.db_path(project_id)) as db:
                     db.execute("UPDATE jobs SET message='开始按清单匹配候选照片', updated_at=? WHERE id=?", (utcnow(), job_id))
-                    slots = db.execute("SELECT id, label FROM checklist_slots ORDER BY ordinal").fetchall()
+                    slots = db.execute("SELECT id, label, item_key, checklist_type_id FROM checklist_slots ORDER BY ordinal").fetchall()
                 for ordinal, slot in enumerate(slots, start=1):
                     try:
-                        self._compute_candidates(project_id, slot["id"], slot["label"], 8)
+                        with connect(self.settings.global_db) as global_db:
+                            aliases = [row["alias"] for row in global_db.execute("SELECT alias FROM checklist_aliases WHERE checklist_type_id=? AND item_key=?", (slot["checklist_type_id"], slot["item_key"] or slot["id"])).fetchall()]
+                        query = " ".join([slot["label"], *aliases])
+                        self._compute_candidates(project_id, slot["id"], query, 8)
                     except Exception:
                         pass
                     with connect(self.db_path(project_id)) as db:
@@ -331,7 +379,7 @@ class ProjectService:
                     )
 
     def start_ocr(self, project_id: str) -> dict:
-        """Recognize gallery text only after the user explicitly requests it."""
+        """Build a local text index only after the user explicitly requests it."""
         root = self.project_root(project_id)
         with connect(self.db_path(project_id)) as db:
             running = db.execute("SELECT * FROM jobs WHERE kind='ocr' AND status='running' ORDER BY created_at DESC LIMIT 1").fetchone()
@@ -342,7 +390,7 @@ class ProjectService:
             ).fetchall()
             job_id = str(uuid.uuid4())
             db.execute(
-                "INSERT INTO jobs VALUES (?, 'ocr', 'queued', 0, ?, '等待开始文字识别', 0, 0, ?, ?)",
+                "INSERT INTO jobs VALUES (?, 'ocr', 'queued', 0, ?, '等待开始本地文字识别', 0, 0, ?, ?)",
                 (job_id, len(photos), utcnow(), utcnow()),
             )
         thread = threading.Thread(target=self._ocr_worker, args=(project_id, job_id), daemon=True)
@@ -350,32 +398,66 @@ class ProjectService:
         thread.start()
         return self.get_job(project_id, job_id)
 
-    def _ocr_worker(self, project_id: str, job_id: str) -> None:
-        root = self.project_root(project_id)
-        client = QwenOcrClient(self.settings.dashscope_api_key, self.settings.ocr_model, self.settings.demo_embeddings)
+    def start_match(self, project_id: str) -> dict:
+        """Re-rank the fixed checklist from existing vectors without re-indexing images."""
+        self.project_root(project_id)
+        with connect(self.db_path(project_id)) as db:
+            running = db.execute("SELECT * FROM jobs WHERE kind='match' AND status='running' ORDER BY created_at DESC LIMIT 1").fetchone()
+            if running:
+                return self._job_dict(running, project_id)
+            if not db.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone():
+                raise ValueError("请先建立图片向量，再执行清单匹配")
+            total = int(db.execute("SELECT COUNT(*) FROM checklist_slots").fetchone()[0])
+            job_id = str(uuid.uuid4())
+            db.execute(
+                "INSERT INTO jobs VALUES (?, 'match', 'queued', 0, ?, '等待按清单重新匹配', 0, 0, ?, ?)",
+                (job_id, total, utcnow(), utcnow()),
+            )
+        thread = threading.Thread(target=self._match_worker, args=(project_id, job_id), daemon=True)
+        self._jobs[job_id] = thread
+        thread.start()
+        return self.get_job(project_id, job_id)
+
+    def _match_worker(self, project_id: str, job_id: str) -> None:
         try:
             with connect(self.db_path(project_id)) as db:
-                db.execute("UPDATE jobs SET status='running', message='正在识别图库中的文字', updated_at=? WHERE id=?", (utcnow(), job_id))
+                db.execute("UPDATE jobs SET status='running', message='正在按清单重新计算候选照片', updated_at=? WHERE id=?", (utcnow(), job_id))
+                slots = db.execute("SELECT id, label, item_key, checklist_type_id FROM checklist_slots ORDER BY ordinal").fetchall()
+            for ordinal, slot in enumerate(slots, start=1):
+                with connect(self.settings.global_db) as global_db:
+                    aliases = [row["alias"] for row in global_db.execute("SELECT alias FROM checklist_aliases WHERE checklist_type_id=? AND item_key=?", (slot["checklist_type_id"], slot["item_key"] or slot["id"])).fetchall()]
+                self._compute_candidates(project_id, slot["id"], " ".join([slot["label"], *aliases]), 8)
+                with connect(self.db_path(project_id)) as db:
+                    db.execute("UPDATE jobs SET current=?, message=?, updated_at=? WHERE id=?", (ordinal, f"正在匹配清单 {ordinal}/{len(slots)}：{slot['label']}", utcnow(), job_id))
+            selected = self.confirm_all_top_candidates(project_id)
+            with connect(self.db_path(project_id)) as db:
+                db.execute("UPDATE jobs SET status='completed', message=?, updated_at=? WHERE id=?", (f"重新匹配完成，已自动选中 {selected['selected_count']} 个最高匹配照片", utcnow(), job_id))
+        except Exception as exc:
+            with connect(self.db_path(project_id)) as db:
+                db.execute("UPDATE jobs SET status='failed', message=?, updated_at=? WHERE id=?", (str(exc)[:1000], utcnow(), job_id))
+
+    def _ocr_worker(self, project_id: str, job_id: str) -> None:
+        root = self.project_root(project_id)
+        client = LocalOcrClient()
+        try:
+            with connect(self.db_path(project_id)) as db:
+                db.execute("UPDATE jobs SET status='running', message='正在用本地 OCR 建立文字索引', updated_at=? WHERE id=?", (utcnow(), job_id))
                 rows = db.execute(
                     "SELECT p.* FROM photos p LEFT JOIN ocr_results o ON o.photo_id=p.id WHERE o.photo_id IS NULL ORDER BY p.created_at"
                 ).fetchall()
             for ordinal, row in enumerate(rows, start=1):
                 original = self.safe_photo_path(project_id, row["id"])
-                derivative = root / "derived" / "ocr" / f"{row['id']}.jpg"
+                derivative = root / "derived" / "ocr" / f"{row['id']}__{row['source_filename']}.jpg"
                 make_derivative(original, derivative, 1600, 90)
-                result = client.extract_text(derivative)
+                text = client.extract_text(derivative)
                 with connect(self.db_path(project_id)) as db:
-                    db.execute("INSERT OR REPLACE INTO ocr_results VALUES (?, ?, ?)", (row["id"], result.text, utcnow()))
+                    db.execute("INSERT OR REPLACE INTO ocr_results VALUES (?, ?, ?)", (row["id"], text, utcnow()))
                     db.execute(
-                        "INSERT INTO api_usage VALUES (?, ?, ?, 'image_ocr', ?, ?, 'success', NULL, ?)",
-                        (str(uuid.uuid4()), job_id, row["id"], self.settings.ocr_model, result.input_tokens, utcnow()),
-                    )
-                    db.execute(
-                        "UPDATE jobs SET current=?, actual_tokens=actual_tokens+?, message=?, updated_at=? WHERE id=?",
-                        (ordinal, result.input_tokens, f"已识别 {ordinal}/{len(rows)} 张图片中的文字", utcnow(), job_id),
+                        "UPDATE jobs SET current=?, message=?, updated_at=? WHERE id=?",
+                        (ordinal, f"本地 OCR 已识别 {ordinal}/{len(rows)} 张图片", utcnow(), job_id),
                     )
             with connect(self.db_path(project_id)) as db:
-                db.execute("UPDATE jobs SET status='completed', message='图库文字识别已完成', updated_at=? WHERE id=?", (utcnow(), job_id))
+                db.execute("UPDATE jobs SET status='completed', message='本地文字索引已完成，可重新匹配清单', updated_at=? WHERE id=?", (utcnow(), job_id))
         except Exception as exc:
             with connect(self.db_path(project_id)) as db:
                 db.execute("UPDATE jobs SET status='failed', message=?, updated_at=? WHERE id=?", (str(exc)[:1000], utcnow(), job_id))
@@ -426,7 +508,10 @@ class ProjectService:
             return 0.0
         if normalized_query in normalized_text:
             return 1.0
-        tokens = re.findall(r"[a-z0-9][a-z0-9._-]{1,}|[\u4e00-\u9fff]{2,}", normalized_query)
+        # Keep IDs (ISO9001, 8.35-39) intact while also allowing meaningful
+        # Chinese terms to contribute independently to a partial OCR match.
+        tokens = re.findall(r"[a-z0-9][a-z0-9._/-]*|[\u4e00-\u9fff]{2,}", normalized_query)
+        tokens = list(dict.fromkeys(token for token in tokens if len(token) > 1))
         if not tokens:
             return 0.0
         hits = sum(token in normalized_text for token in tokens)
@@ -455,9 +540,7 @@ class ProjectService:
             semantic_score = semantic.get(row["id"], -1.0)
             if semantic_score < -0.99 and not ocr_score:
                 continue
-            total = semantic_score + 0.02 * float(row["quality_score"])
-            if ocr_score:
-                total += 1.2 + 0.25 * ocr_score
+            total = 0.70 * semantic_score + 0.25 * ocr_score + 0.05 * float(row["quality_score"])
             ranked.append((total, row, semantic_score, bool(ocr_score)))
         ranked.sort(key=lambda item: item[0], reverse=True)
         return [
@@ -538,11 +621,30 @@ class ProjectService:
         query_vector = self._query_vector(project_id, query)
         matrix, rows = self._vectors_and_photo_rows(project_id)
         semantic = matrix @ query_vector
+        with connect(self.db_path(project_id)) as db:
+            project = db.execute("SELECT checklist_type_id FROM project LIMIT 1").fetchone()
+        with connect(self.settings.global_db) as global_db:
+            profile = global_db.execute("SELECT weights_json FROM preference_profiles WHERE name=?", (project["checklist_type_id"],)).fetchone()
+        weights = {**DEFAULT_MATCH_WEIGHTS, **(json.loads(profile["weights_json"]) if profile else {})}
+        semantic_weight = float(weights.get("semantic", DEFAULT_MATCH_WEIGHTS["semantic"]))
+        quality_weight = float(weights.get("quality", DEFAULT_MATCH_WEIGHTS["quality"]))
+        ocr_weight = float(weights.get("ocr", DEFAULT_MATCH_WEIGHTS["ocr"]))
+        with connect(self.db_path(project_id)) as db:
+            ocr = {row["photo_id"]: row["text"] for row in db.execute("SELECT photo_id, text FROM ocr_results")}
+            rejected_photo_ids = {row["photo_id"] for row in db.execute("SELECT photo_id FROM rejections WHERE slot_id=?", (slot_id,))}
         ranked: list[tuple[float, float, sqlite3.Row]] = []
         for index, row in enumerate(rows):
+            if row["id"] in rejected_photo_ids:
+                continue
             quality = float(row["quality_score"])
             duplicate_penalty = 0.05 if row["near_duplicate_group"] else 0.0
-            total = 0.60 * float(semantic[index]) + 0.10 * quality - duplicate_penalty
+            ocr_score = self._ocr_match_score(query, ocr.get(row["id"], ""))
+            total = (
+                semantic_weight * float(semantic[index])
+                + ocr_weight * ocr_score
+                + quality_weight * quality
+                - duplicate_penalty
+            )
             ranked.append((total, float(semantic[index]), row))
         ranked.sort(key=lambda item: item[0], reverse=True)
         with connect(self.db_path(project_id)) as db:
@@ -553,7 +655,11 @@ class ProjectService:
                     (slot_id, row["id"], semantic_score, row["quality_score"], total, rank, utcnow()),
                 )
             # The user requested automatic selection for the same threshold shown as “高置信度” in the UI.
-            if ranked and ranked[0][0] >= AUTO_CONFIRM_THRESHOLD:
+            if (
+                ranked
+                and ranked[0][0] >= AUTO_CONFIRM_THRESHOLD
+                and ranked[0][1] >= AUTO_CONFIRM_MIN_SEMANTIC
+            ):
                 existing = db.execute("SELECT 1 FROM confirmations WHERE slot_id=?", (slot_id,)).fetchone()
                 rejected = db.execute(
                     "SELECT 1 FROM rejections WHERE slot_id=? AND photo_id=?",
@@ -561,27 +667,25 @@ class ProjectService:
                 ).fetchone()
                 if not existing and not rejected:
                     db.execute(
-                        "INSERT INTO confirmations VALUES (?, ?, ?)",
-                        (slot_id, ranked[0][2]["id"], utcnow()),
+                        "INSERT INTO confirmations(slot_id, photo_id, confirmed_at, source, search_query, system_photo_id) VALUES (?, ?, ?, 'system', NULL, ?)",
+                        (slot_id, ranked[0][2]["id"], utcnow(), ranked[0][2]["id"]),
                     )
 
     def search(self, project_id: str, query: str, top_k: int) -> list[dict]:
         query_vector = self._query_vector(project_id, query)
         matrix, rows = self._vectors_and_photo_rows(project_id)
         semantic = matrix @ query_vector
-        query_terms = {term.lower() for term in query.split() if len(term.strip()) > 1}
-        ranked: list[tuple[float, float, sqlite3.Row]] = []
+        ranked: list[tuple[float, float, sqlite3.Row, bool]] = []
         with connect(self.db_path(project_id)) as db:
             ocr = {row["photo_id"]: row["text"].lower() for row in db.execute("SELECT photo_id, text FROM ocr_results")}
         for index, row in enumerate(rows):
-            text = ocr.get(row["id"], "")
-            ocr_hit = bool(query_terms and any(term in text for term in query_terms))
-            score = float(semantic[index]) + (0.08 if ocr_hit else 0.0) + 0.02 * float(row["quality_score"])
-            ranked.append((score, float(semantic[index]), row))
+            ocr_score = self._ocr_match_score(query, ocr.get(row["id"], ""))
+            score = 0.70 * float(semantic[index]) + 0.25 * ocr_score + 0.05 * float(row["quality_score"])
+            ranked.append((score, float(semantic[index]), row, bool(ocr_score)))
         ranked.sort(key=lambda item: item[0], reverse=True)
         synthetic = []
-        for rank, (score, semantic_score, row) in enumerate(ranked[:top_k], start=1):
-            synthetic.append({"photo_id": row["id"], "total_score": score, "semantic_score": semantic_score, "quality_score": row["quality_score"], "rank": rank})
+        for rank, (score, semantic_score, row, ocr_hit) in enumerate(ranked[:top_k], start=1):
+            synthetic.append({"photo_id": row["id"], "total_score": score, "semantic_score": semantic_score, "quality_score": row["quality_score"], "rank": rank, "ocr_hit": ocr_hit})
         return self._present_candidates(project_id, synthetic)
 
     def _present_candidates(self, project_id: str, candidates: Iterable[sqlite3.Row | dict]) -> list[dict]:
@@ -601,7 +705,7 @@ class ProjectService:
                         "score": round(float(candidate["total_score"]), 4),
                         "semantic_score": round(float(candidate["semantic_score"]), 4),
                         "quality_score": round(float(candidate["quality_score"]), 4),
-                        "ocr_hit": False,
+                        "ocr_hit": bool(candidate.get("ocr_hit", False)) if isinstance(candidate, dict) else False,
                         "used_in_slots": [row["slot_id"] for row in used],
                         "quality_flags": json.loads(photo["quality_flags_json"]),
                     }
@@ -609,31 +713,42 @@ class ProjectService:
         return result
 
     def confirm_all_top_candidates(self, project_id: str) -> dict:
-        """Confirm rank-1 candidates for unconfirmed slots without overwriting human choices."""
+        """Confirm the best available candidates without reusing a photo automatically."""
         self.project_root(project_id)
         with connect(self.db_path(project_id)) as db:
             rows = db.execute(
-                """SELECT s.id AS slot_id, c.photo_id
+                """SELECT s.id AS slot_id, c.photo_id, c.total_score, c.rank
                    FROM checklist_slots s
-                   JOIN candidates c ON c.slot_id=s.id AND c.rank=1
+                   JOIN candidates c ON c.slot_id=s.id
                    WHERE NOT EXISTS (SELECT 1 FROM confirmations x WHERE x.slot_id=s.id)
                      AND NOT EXISTS (SELECT 1 FROM rejections r WHERE r.slot_id=s.id AND r.photo_id=c.photo_id)
-                   ORDER BY s.ordinal"""
+                   ORDER BY c.total_score DESC, c.rank ASC, s.ordinal"""
             ).fetchall()
+            reserved_photo_ids = {
+                row["photo_id"] for row in db.execute("SELECT photo_id FROM confirmations")
+            }
             pending = int(db.execute(
                 "SELECT COUNT(*) FROM checklist_slots s WHERE NOT EXISTS (SELECT 1 FROM confirmations x WHERE x.slot_id=s.id)"
             ).fetchone()[0])
             total = int(db.execute("SELECT COUNT(*) FROM checklist_slots").fetchone()[0])
+        selected_rows = []
+        selected_slot_ids: set[str] = set()
         for row in rows:
-            self.confirm(project_id, row["slot_id"], [row["photo_id"]])
+            if row["slot_id"] in selected_slot_ids or row["photo_id"] in reserved_photo_ids:
+                continue
+            selected_rows.append(row)
+            selected_slot_ids.add(row["slot_id"])
+            reserved_photo_ids.add(row["photo_id"])
+        for row in selected_rows:
+            self.confirm(project_id, row["slot_id"], [row["photo_id"]], source="system")
         return {
-            "selected_count": len(rows),
+            "selected_count": len(selected_rows),
             "skipped_confirmed_count": total - pending,
-            "unmatched_count": max(0, pending - len(rows)),
-            "message": f"已为 {len(rows)} 个未确认清单项选中最高匹配照片",
+            "unmatched_count": max(0, pending - len(selected_rows)),
+            "message": f"已为 {len(selected_rows)} 个未确认清单项选中不重复照片",
         }
 
-    def confirm(self, project_id: str, slot_id: str, photo_ids: list[str]) -> None:
+    def confirm(self, project_id: str, slot_id: str, photo_ids: list[str], source: str = "manual", search_query: str | None = None) -> None:
         root = self.project_root(project_id)
         with connect(self.db_path(project_id)) as db:
             if not db.execute("SELECT 1 FROM checklist_slots WHERE id=?", (slot_id,)).fetchone():
@@ -645,9 +760,27 @@ class ProjectService:
                 path = self._safe_relative(root, photo["relative_path"])
                 if not path.exists() or sha256_file(path) != photo["sha256"]:
                     raise ValueError("照片文件校验失败，无法确认")
+            system = db.execute("SELECT photo_id FROM confirmations WHERE slot_id=? ORDER BY confirmed_at LIMIT 1", (slot_id,)).fetchone()
             db.execute("DELETE FROM confirmations WHERE slot_id=?", (slot_id,))
             for photo_id in photo_ids:
-                db.execute("INSERT INTO confirmations VALUES (?, ?, ?)", (slot_id, photo_id, utcnow()))
+                db.execute(
+                    "INSERT INTO confirmations(slot_id, photo_id, confirmed_at, source, search_query, system_photo_id) VALUES (?, ?, ?, ?, ?, ?)",
+                    (slot_id, photo_id, utcnow(), source, search_query, system["photo_id"] if system else photo_id),
+                )
+                if source == "manual" and system and system["photo_id"] != photo_id:
+                    checklist_type = db.execute("SELECT checklist_type_id FROM project LIMIT 1").fetchone()["checklist_type_id"]
+                    exists = db.execute("SELECT 1 FROM preference_feedback WHERE slot_id=? AND applied=0", (slot_id,)).fetchone()
+                    if not exists:
+                        db.execute(
+                            "INSERT INTO preference_feedback(id, checklist_type_id, slot_id, selected_photo_id, system_photo_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                            (str(uuid.uuid4()), checklist_type, slot_id, photo_id, system["photo_id"], utcnow()),
+                        )
+            if source == "manual" and search_query and search_query.strip():
+                slot = db.execute("SELECT item_key, checklist_type_id FROM checklist_slots WHERE id=?", (slot_id,)).fetchone()
+                db.execute(
+                    "INSERT INTO pending_aliases(id, checklist_type_id, item_key, alias, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), slot["checklist_type_id"], slot["item_key"] or slot_id, search_query.strip(), utcnow()),
+                )
 
     def reject(self, project_id: str, slot_id: str, photo_id: str, reason: str | None) -> None:
         with connect(self.db_path(project_id)) as db:
@@ -656,11 +789,253 @@ class ProjectService:
                 (slot_id, photo_id, reason, utcnow()),
             )
 
+    def import_excel_feedback(self, project_id: str, feedback_path: str) -> dict:
+        """Record retained and deleted images against their original export batch."""
+        self.project_root(project_id)
+        source = Path(feedback_path).expanduser().resolve()
+        if source.suffix.lower() != ".xlsx" or not source.is_file():
+            raise ValueError("用户反馈必须是存在的 .xlsx 清单文件")
+        if source.stat().st_size > 100 * 1024 * 1024:
+            raise ValueError("用户反馈文件超过 100 MB，无法导入")
+        source_sha256 = sha256_file(source)
+
+        try:
+            workbook = load_workbook(source, read_only=False, data_only=False)
+        except Exception as exc:
+            raise ValueError(f"无法读取用户反馈 Excel：{exc}") from exc
+        image_cells: set[tuple[str, str]] = set()
+        for worksheet in workbook.worksheets:
+            for image in worksheet._images:
+                anchor = getattr(image, "anchor", None)
+                origin = getattr(anchor, "_from", None)
+                if origin is not None:
+                    image_cells.add((worksheet.title, f"{get_column_letter(origin.col + 1)}{origin.row + 1}"))
+
+        with connect(self.db_path(project_id)) as db:
+            if db.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1").fetchone():
+                raise ValueError("当前项目仍有任务运行，暂不能导入用户反馈")
+            if db.execute("SELECT 1 FROM feedback_imports WHERE source_sha256=?", (source_sha256,)).fetchone():
+                raise ValueError("这份用户反馈已经导入过")
+            slots = db.execute(
+                "SELECT id, sheet_name, image_cell FROM checklist_slots ORDER BY ordinal",
+            ).fetchall()
+            if not slots:
+                raise ValueError("当前项目没有可导入反馈的清单字段")
+            required_sheets = {slot["sheet_name"] for slot in slots}
+            if not required_sheets.issubset(set(workbook.sheetnames)):
+                raise ValueError("该 Excel 缺少质量清单工作表，请确认导入的是本系统导出的清单")
+
+            slot_cells = {(slot["sheet_name"], slot["image_cell"]): slot["id"] for slot in slots}
+            feedback_cells = image_cells.intersection(slot_cells)
+            batches = db.execute("SELECT id, output_relative_path FROM export_batches ORDER BY created_at DESC").fetchall()
+            # Users commonly append “修改” to the exported filename. Keep the
+            # timestamp as a stable link to the exact original export when it
+            # is still present; otherwise use the image-cell overlap fallback.
+            stamp_match = re.search(r"\d{8}-\d{6}", source.stem)
+            if stamp_match:
+                stamp = stamp_match.group(0)
+                timestamp_batches = [
+                    batch
+                    for batch in batches
+                    if stamp in Path(batch["output_relative_path"]).stem
+                ]
+                if timestamp_batches:
+                    batches = timestamp_batches
+            best_batch: str | None = None
+            best_output_name = ""
+            best_items: list[sqlite3.Row] = []
+            best_overlap = -1
+            for batch in batches:
+                items = db.execute(
+                    """SELECT i.*, s.sheet_name, s.image_cell
+                       FROM export_batch_items i JOIN checklist_slots s ON s.id=i.slot_id
+                       WHERE i.export_id=?""",
+                    (batch["id"],),
+                ).fetchall()
+                item_cells = {(item["sheet_name"], item["image_cell"]) for item in items}
+                overlap = len(feedback_cells.intersection(item_cells))
+                if feedback_cells and overlap == 0:
+                    continue
+                if overlap > best_overlap:
+                    best_batch, best_output_name, best_items, best_overlap = batch["id"], Path(batch["output_relative_path"]).name, items, overlap
+            if not best_batch or not best_items:
+                raise ValueError("未找到可对应的原始导出批次。请使用升级后重新导出的清单收集用户反馈")
+
+            import_id = str(uuid.uuid4())
+            db.execute(
+                "INSERT INTO feedback_imports(id, source_sha256, source_filename, export_id, imported_at) VALUES (?, ?, ?, ?, ?)",
+                (import_id, source_sha256, source.name, best_batch, utcnow()),
+            )
+            accepted_count = 0
+            rejected_count = 0
+            for item in best_items:
+                cell = (item["sheet_name"], item["image_cell"])
+                retained = cell in feedback_cells
+                outcome = "accepted" if retained else "rejected"
+                db.execute(
+                    """INSERT INTO feedback_events(id, import_id, export_id, slot_id, system_photo_id, selected_photo_id, outcome, source, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'excel_feedback', ?)""",
+                    (
+                        str(uuid.uuid4()), import_id, best_batch, item["slot_id"], item["system_photo_id"],
+                        item["selected_photo_id"] if retained else None, outcome, utcnow(),
+                    ),
+                )
+                if retained:
+                    accepted_count += 1
+                    continue
+                rejected_count += 1
+                db.execute(
+                    "INSERT OR REPLACE INTO rejections VALUES (?, ?, ?, ?)",
+                    (item["slot_id"], item["selected_photo_id"], "用户反馈 Excel 中已删除图片", utcnow()),
+                )
+                # If a later manual correction already changed this field, keep it.
+                db.execute(
+                    "DELETE FROM confirmations WHERE slot_id=? AND photo_id=?",
+                    (item["slot_id"], item["selected_photo_id"]),
+                )
+                db.execute("DELETE FROM candidates WHERE slot_id=?", (item["slot_id"],))
+
+        return {
+            "status": "imported",
+            "export_id": best_batch,
+            "baseline_export_name": best_output_name,
+            "accepted_count": accepted_count,
+            "rejected_count": rejected_count,
+            "message": f"已导入用户反馈：确认正确 {accepted_count} 项，标记错误 {rejected_count} 项；重新匹配时将排除错误图片。",
+        }
+
     def set_mapping(self, project_id: str, slot_id: str, bookmark: str) -> None:
         with connect(self.db_path(project_id)) as db:
             changed = db.execute("UPDATE checklist_slots SET bookmark=? WHERE id=?", (bookmark, slot_id)).rowcount
             if changed != 1:
                 raise ValueError("清单项目不存在")
+
+    def export_preflight(self, project_id: str) -> dict:
+        self.project_root(project_id)
+        with connect(self.db_path(project_id)) as db:
+            project = db.execute("SELECT factory_name, checklist_type_id FROM project LIMIT 1").fetchone()
+            total = int(db.execute("SELECT COUNT(*) FROM checklist_slots").fetchone()[0])
+            selected = int(db.execute("SELECT COUNT(DISTINCT slot_id) FROM confirmations").fetchone()[0])
+            overrides = int(db.execute("SELECT COUNT(*) FROM confirmations WHERE source='manual' AND system_photo_id != photo_id").fetchone()[0])
+            pending_aliases = int(db.execute("SELECT COUNT(*) FROM pending_aliases WHERE confirmed_at IS NULL").fetchone()[0])
+            jobs = db.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
+            feedback_records = int(db.execute("SELECT COUNT(*) FROM feedback_events").fetchone()[0])
+        return {
+            "ready": True,
+            "total_slots": total,
+            "selected_slots": selected,
+            "missing_slots": max(0, total - selected),
+            "active_overrides": overrides,
+            "pending_aliases": pending_aliases,
+            "feedback_records": feedback_records,
+            "active_jobs": int(jobs),
+            "message": f"已积累 {feedback_records} 条有效反馈；本次主动换图 {overrides} 项；发现 {pending_aliases} 个待确认别名。",
+            "allow_partial": True,
+            "factory_name": project["factory_name"],
+            "checklist_type_id": project["checklist_type_id"],
+        }
+
+    def export_excel(self, project_id: str, allow_partial: bool = True) -> dict:
+        root = self.project_root(project_id)
+        with connect(self.db_path(project_id)) as db:
+            project = db.execute("SELECT factory_name, checklist_type_id FROM project LIMIT 1").fetchone()
+            rows = db.execute(
+                """SELECT s.id AS slot_id, s.item_key, p.relative_path, c.photo_id AS selected_photo_id,
+                          c.system_photo_id, k.semantic_score, k.quality_score, k.total_score, k.rank
+                   FROM checklist_slots s JOIN confirmations c ON c.slot_id=s.id JOIN photos p ON p.id=c.photo_id
+                   LEFT JOIN candidates k ON k.slot_id=s.id AND k.photo_id=c.photo_id
+                   ORDER BY s.ordinal"""
+            ).fetchall()
+            total = int(db.execute("SELECT COUNT(*) FROM checklist_slots").fetchone()[0])
+        if not allow_partial and len(rows) < total:
+            raise ValueError(f"尚有 {total - len(rows)} 个清单项未选图")
+        selections = {row["item_key"]: self._safe_relative(root, row["relative_path"]) for row in rows}
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        output = root / "outputs" / f"{project['factory_name']}__{project['checklist_type_id']}__{stamp}.xlsx"
+        result = export_workbook(project["checklist_type_id"], selections, output)
+        export_id = str(uuid.uuid4())
+        with connect(self.db_path(project_id)) as db:
+            pending_feedback = db.execute("SELECT * FROM preference_feedback WHERE applied=0").fetchall()
+            batch_overrides = len(pending_feedback)
+            batch_aliases = int(db.execute("SELECT COUNT(*) FROM pending_aliases WHERE confirmed_at IS NULL").fetchone()[0])
+            db.execute("INSERT INTO export_batches(id, output_relative_path, created_at) VALUES (?, ?, ?)", (export_id, output.relative_to(root).as_posix(), utcnow()))
+            for row in rows:
+                db.execute(
+                    """INSERT INTO export_batch_items(export_id, slot_id, selected_photo_id, system_photo_id, semantic_score, quality_score, total_score, rank)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (export_id, row["slot_id"], row["selected_photo_id"], row["system_photo_id"], row["semantic_score"], row["quality_score"], row["total_score"], row["rank"]),
+                )
+            for feedback in pending_feedback:
+                db.execute(
+                    """INSERT INTO feedback_events(id, export_id, slot_id, system_photo_id, selected_photo_id, outcome, source, created_at)
+                       VALUES (?, ?, ?, ?, ?, 'replaced', 'manual', ?)""",
+                    (str(uuid.uuid4()), export_id, feedback["slot_id"], feedback["system_photo_id"], feedback["selected_photo_id"], utcnow()),
+                )
+            db.execute("UPDATE preference_feedback SET applied=1, export_id=? WHERE applied=0", (export_id,))
+            db.execute("UPDATE pending_aliases SET confirmed_at=? WHERE confirmed_at IS NULL", (utcnow(),))
+            aliases = db.execute("SELECT checklist_type_id, item_key, alias FROM pending_aliases WHERE confirmed_at IS NOT NULL AND alias != ''").fetchall()
+            feedback_count = int(db.execute("SELECT COUNT(*) FROM feedback_events").fetchone()[0])
+        with connect(self.settings.global_db) as global_db:
+            for alias in aliases:
+                global_db.execute(
+                    "INSERT OR IGNORE INTO checklist_aliases(checklist_type_id, item_key, alias, source) VALUES (?, ?, ?, 'search')",
+                    (alias["checklist_type_id"], alias["item_key"], alias["alias"]),
+                )
+        result.update(self.export_preflight(project_id))
+        result.update({"export_id": export_id, "output_path": str(output), "feedback_records": feedback_count, "message": f"本次主动换图 {batch_overrides} 项；已积累有效反馈 {feedback_count} 条；发现 {batch_aliases} 个待确认别名；缺图 {result.get('missing_count', 0)} 项。"})
+        return result
+
+    def clear_gallery(self, project_id: str, factory_name: str) -> dict:
+        root = self.project_root(project_id)
+        with connect(self.db_path(project_id)) as db:
+            project = db.execute("SELECT factory_name FROM project LIMIT 1").fetchone()
+            if not project or project["factory_name"] != factory_name:
+                raise ValueError("请输入当前项目名称确认清空图库")
+            running = db.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1").fetchone()
+            if running:
+                raise ValueError("向量化或文字识别任务运行中，暂不能清空图库")
+            photos = [row["relative_path"] for row in db.execute("SELECT relative_path FROM photos")]
+            derived = [row["embedding_relative_path"] for row in db.execute("SELECT embedding_relative_path FROM photos WHERE embedding_relative_path IS NOT NULL")]
+            for table in ("candidates", "confirmations", "rejections", "ocr_results", "embeddings", "photos", "search_cache", "preference_feedback", "pending_aliases"):
+                db.execute(f"DELETE FROM {table}")
+            db.execute("UPDATE project SET status='created'")
+        for relative in photos + derived:
+            if relative:
+                path = self._safe_relative(root, relative)
+                if path.is_file():
+                    path.unlink()
+        for folder in (root / "originals", root / "derived" / "embedding", root / "derived" / "ocr"):
+            for path in folder.glob("*"):
+                if path.is_file():
+                    path.unlink()
+        return {"status": "cleared", "deleted_photos": len(photos), "message": "当前项目图库、向量和 OCR 已清空，外部源图库与 Excel 输出未修改。"}
+
+    def convert_project(self, project_id: str, checklist_type_id: str = "quality_v1") -> dict:
+        """Rebind an older Word-based project to the fixed Excel checklist.
+
+        Photo files, embeddings, OCR and API usage are intentionally untouched;
+        only checklist/matching/report metadata is rebuilt.
+        """
+        root = self.project_root(project_id)
+        checklist = get_checklist_type(checklist_type_id)
+        destination = root / "templates" / f"{checklist_type_id}.xlsx"
+        copy_template(checklist_type_id, destination)
+        with connect(self.db_path(project_id)) as db:
+            db.execute("DELETE FROM candidates")
+            db.execute("DELETE FROM confirmations")
+            db.execute("DELETE FROM rejections")
+            db.execute("DELETE FROM preference_feedback")
+            db.execute("DELETE FROM pending_aliases")
+            for table in ("report_slot_manifest", "report_slot_selections", "report_slot_candidates", "report_slots", "report_manifest", "report_runs", "history_matches"):
+                db.execute(f"DELETE FROM {table}")
+            db.execute("DELETE FROM checklist_slots")
+            for slot in checklist.slots:
+                db.execute(
+                    "INSERT INTO checklist_slots(id, label, section, ordinal, bookmark, item_key, checklist_type_id, sheet_name, label_cell, image_cell, created_at) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), slot.label, slot.section, slot.ordinal, slot.item_key, checklist_type_id, slot.sheet_name, slot.label_cell, slot.image_cell, utcnow()),
+                )
+            db.execute("UPDATE project SET template_relative_path=?, checklist_relative_path=?, checklist_type_id=?, schema_version=2, status=CASE WHEN EXISTS(SELECT 1 FROM embeddings) THEN 'indexed' ELSE 'created' END", (destination.relative_to(root).as_posix(), destination.relative_to(root).as_posix(), checklist_type_id))
+        return self.get_project(project_id)
 
     def template_bookmarks(self, project_id: str) -> list[str]:
         root = self.project_root(project_id)
@@ -685,7 +1060,9 @@ class ProjectService:
         media = extract_history_media(report)
         with connect(self.db_path(project_id)) as db:
             photos = db.execute("SELECT id, sha256, dhash FROM photos").fetchall()
-            slots = db.execute("SELECT id, label FROM checklist_slots").fetchall()
+            slots = db.execute(
+                "SELECT id, label, item_key, checklist_type_id FROM checklist_slots"
+            ).fetchall()
             db.execute("DELETE FROM history_matches WHERE report_relative_path=?", (report.relative_to(root).as_posix(),))
             matched = 0
             for item in media:
@@ -735,9 +1112,21 @@ class ProjectService:
                             aliases = (aliases + [alias])[-20:]
                             global_db.execute(
                                 "INSERT INTO checklist_catalog(label, aliases_json) VALUES (?, ?) "
-                                "ON CONFLICT(label) DO UPDATE SET aliases_json=excluded.aliases",
+                                "ON CONFLICT(label) DO UPDATE SET aliases_json=excluded.aliases_json",
                                 (label, json.dumps(aliases, ensure_ascii=False)),
                             )
+                        if alias and len(alias) <= 100:
+                            matched_slot = next(slot for slot in slots if slot["id"] == slot_id)
+                            if matched_slot["item_key"]:
+                                global_db.execute(
+                                    "INSERT OR IGNORE INTO checklist_aliases"
+                                    "(checklist_type_id, item_key, alias, source) VALUES (?, ?, ?, 'history')",
+                                    (
+                                        matched_slot["checklist_type_id"],
+                                        matched_slot["item_key"],
+                                        alias,
+                                    ),
+                                )
         return {"media_count": len(media), "matched_count": matched}
 
     @staticmethod

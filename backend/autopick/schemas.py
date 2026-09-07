@@ -9,9 +9,15 @@ from pydantic import BaseModel, Field
 class ProjectCreate(BaseModel):
     factory_name: str = Field(min_length=2, max_length=160)
     gallery_path: str
-    template_path: str
-    checklist_path: str | None = None
-    history_report_path: str | None = None
+    checklist_type_id: str = "quality_v1"
+
+
+class ProjectDeleteRequest(BaseModel):
+    factory_name: str = Field(min_length=2, max_length=160)
+
+
+class FeedbackImportRequest(BaseModel):
+    feedback_path: str = Field(min_length=1, max_length=1000)
 
 
 class ProjectSummary(BaseModel):
@@ -24,6 +30,7 @@ class ProjectSummary(BaseModel):
     confirmed_count: int = 0
     slot_count: int = 0
     template_name: str = ""
+    checklist_type_id: str = "quality_v1"
 
 
 class TemplateReplaceRequest(BaseModel):
@@ -49,7 +56,9 @@ class SearchRequest(BaseModel):
 
 
 class ConfirmRequest(BaseModel):
-    photo_ids: list[str] = Field(min_length=1, max_length=8)
+    photo_id: str
+    source: str = "manual"
+    search_query: str | None = Field(default=None, max_length=500)
 
 
 class RejectRequest(BaseModel):
