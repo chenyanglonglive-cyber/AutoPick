@@ -112,6 +112,25 @@ def test_rematch_removes_duplicate_automatic_selections_within_one_checklist(tmp
     assert sum(bool(slot["confirmed_photo_ids"]) for slot in service.list_slots(project["id"], "quality_v1")[:2]) == 1
 
 
+def test_automatic_selection_leaves_low_confidence_field_blank(tmp_path: Path) -> None:
+    gallery = tmp_path / "gallery"
+    gallery.mkdir()
+    _image(gallery / "evidence.jpg")
+    service = ProjectService(Settings(tmp_path / "data", None, True, "token"))
+    project = service.create_project("Factory", str(gallery))
+    slot = service.list_slots(project["id"], "quality_v1")[0]
+    photo_id = service.list_gallery(project["id"])[0]["photo_id"]
+    with connect(service.db_path(project["id"])) as db:
+        db.execute(
+            "INSERT INTO candidates VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (slot["id"], photo_id, 0.17, 1.0, 0.34, 1, "now"),
+        )
+
+    result = service.confirm_all_top_candidates(project["id"], "quality_v1")
+    assert result["selected_count"] == 0
+    assert service.list_slots(project["id"], "quality_v1")[0]["confirmed_photo_ids"] == []
+
+
 def test_clear_gallery_keeps_export_and_external_source(tmp_path: Path) -> None:
     gallery = tmp_path / "gallery"
     gallery.mkdir()

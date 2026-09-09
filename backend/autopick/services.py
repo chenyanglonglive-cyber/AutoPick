@@ -36,6 +36,8 @@ from backend.autopick.excel_checklist import copy_template, get_checklist_type, 
 
 
 DEFAULT_MATCH_WEIGHTS = {"semantic": 0.62, "quality": 0.10, "ocr": 0.28}
+AUTO_CONFIRM_THRESHOLD = 0.35
+AUTO_CONFIRM_MIN_SEMANTIC = 0.18
 
 
 def utcnow() -> str:
@@ -391,6 +393,7 @@ class ProjectService:
                             ),
                         )
                 for checklist_type_id in {slot["checklist_type_id"] for slot in slots}:
+                    self._clear_unsuitable_system_confirmations(project_id, checklist_type_id)
                     self._deduplicate_system_confirmations(project_id, checklist_type_id)
                     self.confirm_all_top_candidates(project_id, checklist_type_id)
                 with connect(self.db_path(project_id)) as db:
@@ -465,6 +468,7 @@ class ProjectService:
                 self._compute_candidates(project_id, slot["id"], " ".join([slot["label"], *aliases]), 8)
                 with connect(self.db_path(project_id)) as db:
                     db.execute("UPDATE jobs SET current=?, message=?, updated_at=? WHERE id=?", (ordinal, f"正在匹配清单 {ordinal}/{len(slots)}：{slot['label']}", utcnow(), job_id))
+            self._clear_unsuitable_system_confirmations(project_id, checklist_type_id)
             self._deduplicate_system_confirmations(project_id, checklist_type_id)
             selected = self.confirm_all_top_candidates(project_id, checklist_type_id)
             with connect(self.db_path(project_id)) as db:
@@ -756,8 +760,10 @@ class ProjectService:
                    WHERE s.checklist_type_id=?
                      AND NOT EXISTS (SELECT 1 FROM confirmations x WHERE x.slot_id=s.id)
                      AND NOT EXISTS (SELECT 1 FROM rejections r WHERE r.slot_id=s.id AND r.photo_id=c.photo_id)
+                     AND c.total_score>=?
+                     AND c.semantic_score>=?
                    ORDER BY c.total_score DESC, c.rank ASC, s.ordinal""",
-                (checklist_type_id,),
+                (checklist_type_id, AUTO_CONFIRM_THRESHOLD, AUTO_CONFIRM_MIN_SEMANTIC),
             ).fetchall()
             reserved_photo_ids = {
                 row["photo_id"] for row in db.execute(
@@ -809,6 +815,24 @@ class ProjectService:
             for slot_id in duplicate_slot_ids:
                 db.execute("DELETE FROM confirmations WHERE slot_id=? AND source='system'", (slot_id,))
         return len(duplicate_slot_ids)
+
+    def _clear_unsuitable_system_confirmations(self, project_id: str, checklist_type_id: str) -> int:
+        """Leave a field blank when its current system choice no longer meets the threshold."""
+        with connect(self.db_path(project_id)) as db:
+            cleared = db.execute(
+                """DELETE FROM confirmations
+                   WHERE source='system'
+                     AND slot_id IN (SELECT id FROM checklist_slots WHERE checklist_type_id=?)
+                     AND NOT EXISTS (
+                         SELECT 1 FROM candidates c
+                         WHERE c.slot_id=confirmations.slot_id
+                           AND c.photo_id=confirmations.photo_id
+                           AND c.total_score>=?
+                           AND c.semantic_score>=?
+                     )""",
+                (checklist_type_id, AUTO_CONFIRM_THRESHOLD, AUTO_CONFIRM_MIN_SEMANTIC),
+            ).rowcount
+        return int(cleared)
 
     def confirm(self, project_id: str, slot_id: str, photo_ids: list[str], source: str = "manual", search_query: str | None = None) -> None:
         root = self.project_root(project_id)
