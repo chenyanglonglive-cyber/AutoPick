@@ -106,3 +106,34 @@ def test_auto_confirm_does_not_reuse_a_photo_between_fields(tmp_path: Path) -> N
     with connect(service.db_path(project["id"])) as db:
         selected = db.execute("SELECT photo_id FROM confirmations ORDER BY slot_id").fetchall()
     assert {row["photo_id"] for row in selected} == {photos[0]["id"], photos[1]["id"]}
+
+
+def test_training_readiness_reaches_configured_threshold(tmp_path: Path) -> None:
+    settings = Settings(
+        tmp_path / "data", None, True, "test-token",
+        training_feedback_threshold=2,
+    )
+    service = ProjectService(settings)
+    gallery = tmp_path / "gallery"
+    gallery.mkdir()
+    Image.new("RGB", (1200, 800), (80, 90, 100)).save(gallery / "photo.jpg", "JPEG")
+    project = service.create_project("Factory", str(gallery), checklist_type_id="quality_v1")
+    slots = service.list_slots(project["id"])[:2]
+    with connect(service.db_path(project["id"])) as db:
+        db.executemany(
+            """INSERT INTO feedback_events(
+                   id, export_id, slot_id, outcome, source, created_at
+               ) VALUES (?, ?, ?, 'accepted', 'excel_feedback', CURRENT_TIMESTAMP)""",
+            [
+                ("feedback-1", "export-1", slots[0]["id"]),
+                ("feedback-2", "export-2", slots[1]["id"]),
+            ],
+        )
+
+    readiness = service.export_preflight(project["id"])
+
+    assert readiness["training_data_count"] == 2
+    assert readiness["training_data_threshold"] == 2
+    assert readiness["training_progress_percent"] == 100
+    assert readiness["training_remaining"] == 0
+    assert readiness["training_ready"] is True

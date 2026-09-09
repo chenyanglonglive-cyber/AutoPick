@@ -25,6 +25,7 @@ from backend.autopick.schemas import (
 )
 from backend.autopick.services import ProjectNotFoundError, ProjectService
 from backend.autopick.excel_checklist import type_payload
+from backend.autopick.version import current_version
 
 
 API_VERSION = "2026-08-26"
@@ -54,7 +55,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/session")
     def session() -> dict:
         # Bound to loopback only; the UI immediately keeps this value in memory.
-        return {"token": settings.session_token, "embedding_model": settings.embedding_model, "demo_embeddings": settings.demo_embeddings}
+        return {
+            "token": settings.session_token,
+            "embedding_model": settings.embedding_model,
+            "demo_embeddings": settings.demo_embeddings,
+            "version": current_version(),
+        }
 
     @app.get("/api/health")
     def health() -> dict:
@@ -102,9 +108,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/projects/{project_id}/match", response_model=JobResponse, dependencies=[Depends(require_session)])
-    def match_project(project_id: str) -> dict:
+    def match_project(project_id: str, checklist_type_id: str | None = None) -> dict:
         try:
-            return projects.start_match(project_id)
+            return projects.start_match(project_id, checklist_type_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -113,8 +119,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return projects.get_job(project_id, job_id)
 
     @app.get("/api/projects/{project_id}/checklist", response_model=list[ChecklistSlot], dependencies=[Depends(require_session)])
-    def checklist(project_id: str) -> list[dict]:
-        return projects.list_slots(project_id)
+    def checklist(project_id: str, checklist_type_id: str | None = None) -> list[dict]:
+        return projects.list_slots(project_id, checklist_type_id)
 
     @app.get("/api/projects/{project_id}/gallery", response_model=list[GalleryPhotoResponse], dependencies=[Depends(require_session)])
     def gallery(project_id: str) -> list[dict]:
@@ -136,9 +142,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/projects/{project_id}/search", response_model=list[CandidateResponse], dependencies=[Depends(require_session)])
-    def search(project_id: str, payload: SearchRequest) -> list[dict]:
+    def search(project_id: str, payload: SearchRequest, checklist_type_id: str | None = None) -> list[dict]:
         try:
-            return projects.search(project_id, payload.query, payload.top_k)
+            return projects.search(project_id, payload.query, payload.top_k, checklist_type_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -151,9 +157,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/projects/{project_id}/slots/confirm-top", dependencies=[Depends(require_session)])
-    def confirm_top_candidates(project_id: str) -> dict:
+    def confirm_top_candidates(project_id: str, checklist_type_id: str | None = None) -> dict:
         try:
-            return projects.confirm_all_top_candidates(project_id)
+            return projects.confirm_all_top_candidates(project_id, checklist_type_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -163,13 +169,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "rejected"}
 
     @app.get("/api/projects/{project_id}/export/preflight", dependencies=[Depends(require_session)])
-    def export_preflight(project_id: str) -> dict:
-        return projects.export_preflight(project_id)
+    def export_preflight(project_id: str, checklist_type_id: str | None = None) -> dict:
+        return projects.export_preflight(project_id, checklist_type_id)
 
     @app.post("/api/projects/{project_id}/export", dependencies=[Depends(require_session)])
-    def export_excel(project_id: str, allow_partial: bool = True) -> dict:
+    def export_excel(project_id: str, allow_partial: bool = True, checklist_type_id: str | None = None) -> dict:
         try:
-            result = projects.export_excel(project_id, allow_partial=allow_partial)
+            result = projects.export_excel(project_id, allow_partial=allow_partial, checklist_type_id=checklist_type_id)
             result["download_url"] = f"/api/projects/{project_id}/outputs/{Path(result['output_path']).name}?token={settings.session_token}"
             return result
         except ValueError as exc:

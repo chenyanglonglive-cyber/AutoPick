@@ -35,8 +35,6 @@ from backend.autopick.qwen import QwenEmbeddingClient
 from backend.autopick.excel_checklist import copy_template, get_checklist_type, export_workbook
 
 
-AUTO_CONFIRM_THRESHOLD = 0.35
-AUTO_CONFIRM_MIN_SEMANTIC = 0.18
 DEFAULT_MATCH_WEIGHTS = {"semantic": 0.62, "quality": 0.10, "ocr": 0.28}
 
 
@@ -66,10 +64,50 @@ class ProjectService:
         # Schema additions must also reach projects created by earlier versions.
         initialize_project(database)
         with connect(database) as db:
-            slot_state = db.execute("SELECT COUNT(*) AS count, SUM(CASE WHEN item_key IS NULL THEN 1 ELSE 0 END) AS legacy FROM checklist_slots").fetchone()
-        if int(slot_state["count"] or 0) != 199 or int(slot_state["legacy"] or 0) > 0:
-            self._migrate_fixed_root(root, database, "quality_v1")
+            project = db.execute("SELECT checklist_type_id FROM project LIMIT 1").fetchone()
+        checklist_type_id = project["checklist_type_id"] if project and project["checklist_type_id"] else "quality_v1"
+        with connect(database) as db:
+            slot_state = db.execute(
+                "SELECT COUNT(*) AS count, SUM(CASE WHEN item_key IS NULL THEN 1 ELSE 0 END) AS legacy FROM checklist_slots WHERE checklist_type_id=?",
+                (checklist_type_id,),
+            ).fetchone()
+        expected_slot_count = len(get_checklist_type(checklist_type_id).slots)
+        if int(slot_state["count"] or 0) != expected_slot_count or int(slot_state["legacy"] or 0) > 0:
+            self._migrate_fixed_root(root, database, checklist_type_id)
         return root
+
+    @staticmethod
+    def _insert_checklist_slots(db: sqlite3.Connection, checklist_type_id: str) -> None:
+        checklist = get_checklist_type(checklist_type_id)
+        for slot in checklist.slots:
+            db.execute(
+                "INSERT INTO checklist_slots(id, label, section, ordinal, bookmark, item_key, checklist_type_id, sheet_name, label_cell, image_cell, created_at) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), slot.label, slot.section, slot.ordinal, slot.item_key, checklist_type_id, slot.sheet_name, slot.label_cell, slot.image_cell, utcnow()),
+            )
+
+    def _ensure_project_checklist(self, root: Path, database: Path, checklist_type_id: str) -> None:
+        """Add one requested checklist without touching another checklist's evidence."""
+        checklist = get_checklist_type(checklist_type_id)
+        with connect(database) as db:
+            count = int(db.execute(
+                "SELECT COUNT(*) FROM checklist_slots WHERE checklist_type_id=?", (checklist_type_id,)
+            ).fetchone()[0])
+            if count == len(checklist.slots):
+                return
+            if count:
+                raise ValueError(f"清单 {checklist_type_id} 的字段不完整，请先完成项目迁移")
+            copy_template(checklist_type_id, root / "templates" / f"{checklist_type_id}.xlsx")
+            self._insert_checklist_slots(db, checklist_type_id)
+
+    def _resolve_project_checklist(self, project_id: str, requested_type_id: str | None = None) -> tuple[Path, str]:
+        root = self.project_root(project_id)
+        database = root / "project.sqlite"
+        with connect(database) as db:
+            project = db.execute("SELECT checklist_type_id FROM project LIMIT 1").fetchone()
+        checklist_type_id = requested_type_id or project["checklist_type_id"]
+        get_checklist_type(checklist_type_id)
+        self._ensure_project_checklist(root, database, checklist_type_id)
+        return root, checklist_type_id
 
     def _migrate_fixed_root(self, root: Path, database: Path, checklist_type_id: str) -> None:
         checklist = get_checklist_type(checklist_type_id)
@@ -87,11 +125,7 @@ class ProjectService:
             for table in ("candidates", "confirmations", "rejections", "preference_feedback", "pending_aliases", "report_slot_manifest", "report_slot_selections", "report_slot_candidates", "report_slots", "report_manifest", "report_runs", "history_matches"):
                 db.execute(f"DELETE FROM {table}")
             db.execute("DELETE FROM checklist_slots")
-            for slot in checklist.slots:
-                db.execute(
-                    "INSERT INTO checklist_slots(id, label, section, ordinal, bookmark, item_key, checklist_type_id, sheet_name, label_cell, image_cell, created_at) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
-                    (str(uuid.uuid4()), slot.label, slot.section, slot.ordinal, slot.item_key, checklist_type_id, slot.sheet_name, slot.label_cell, slot.image_cell, utcnow()),
-                )
+            self._insert_checklist_slots(db, checklist_type_id)
             db.execute("UPDATE project SET template_relative_path=?, checklist_relative_path=?, checklist_type_id=?, schema_version=2", (destination.relative_to(root).as_posix(), destination.relative_to(root).as_posix(), checklist_type_id))
 
     def db_path(self, project_id: str) -> Path:
@@ -149,11 +183,7 @@ class ProjectService:
                     checklist_type_id,
                 ),
             )
-            for slot in checklist.slots:
-                db.execute(
-                    "INSERT INTO checklist_slots(id, label, section, ordinal, bookmark, item_key, checklist_type_id, sheet_name, label_cell, image_cell, created_at) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
-                    (str(uuid.uuid4()), slot.label, slot.section, slot.ordinal, slot.item_key, checklist_type_id, slot.sheet_name, slot.label_cell, slot.image_cell, utcnow()),
-                )
+            self._insert_checklist_slots(db, checklist_type_id)
         self._sync_catalog([(slot.label, slot.section) for slot in checklist.slots])
         self.import_gallery(project_id, gallery)
         return self.get_project(project_id)
@@ -360,6 +390,9 @@ class ProjectService:
                                 job_id,
                             ),
                         )
+                for checklist_type_id in {slot["checklist_type_id"] for slot in slots}:
+                    self._deduplicate_system_confirmations(project_id, checklist_type_id)
+                    self.confirm_all_top_candidates(project_id, checklist_type_id)
                 with connect(self.db_path(project_id)) as db:
                     db.execute("UPDATE jobs SET status='completed', message='图片向量化与清单匹配已全部完成', updated_at=? WHERE id=?", (utcnow(), job_id))
                     db.execute("UPDATE project SET status='indexed'")
@@ -398,38 +431,42 @@ class ProjectService:
         thread.start()
         return self.get_job(project_id, job_id)
 
-    def start_match(self, project_id: str) -> dict:
+    def start_match(self, project_id: str, checklist_type_id: str | None = None) -> dict:
         """Re-rank the fixed checklist from existing vectors without re-indexing images."""
-        self.project_root(project_id)
+        _, checklist_type_id = self._resolve_project_checklist(project_id, checklist_type_id)
         with connect(self.db_path(project_id)) as db:
             running = db.execute("SELECT * FROM jobs WHERE kind='match' AND status='running' ORDER BY created_at DESC LIMIT 1").fetchone()
             if running:
                 return self._job_dict(running, project_id)
             if not db.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone():
                 raise ValueError("请先建立图片向量，再执行清单匹配")
-            total = int(db.execute("SELECT COUNT(*) FROM checklist_slots").fetchone()[0])
+            total = int(db.execute("SELECT COUNT(*) FROM checklist_slots WHERE checklist_type_id=?", (checklist_type_id,)).fetchone()[0])
             job_id = str(uuid.uuid4())
             db.execute(
                 "INSERT INTO jobs VALUES (?, 'match', 'queued', 0, ?, '等待按清单重新匹配', 0, 0, ?, ?)",
                 (job_id, total, utcnow(), utcnow()),
             )
-        thread = threading.Thread(target=self._match_worker, args=(project_id, job_id), daemon=True)
+        thread = threading.Thread(target=self._match_worker, args=(project_id, job_id, checklist_type_id), daemon=True)
         self._jobs[job_id] = thread
         thread.start()
         return self.get_job(project_id, job_id)
 
-    def _match_worker(self, project_id: str, job_id: str) -> None:
+    def _match_worker(self, project_id: str, job_id: str, checklist_type_id: str) -> None:
         try:
             with connect(self.db_path(project_id)) as db:
                 db.execute("UPDATE jobs SET status='running', message='正在按清单重新计算候选照片', updated_at=? WHERE id=?", (utcnow(), job_id))
-                slots = db.execute("SELECT id, label, item_key, checklist_type_id FROM checklist_slots ORDER BY ordinal").fetchall()
+                slots = db.execute(
+                    "SELECT id, label, item_key, checklist_type_id FROM checklist_slots WHERE checklist_type_id=? ORDER BY ordinal",
+                    (checklist_type_id,),
+                ).fetchall()
             for ordinal, slot in enumerate(slots, start=1):
                 with connect(self.settings.global_db) as global_db:
                     aliases = [row["alias"] for row in global_db.execute("SELECT alias FROM checklist_aliases WHERE checklist_type_id=? AND item_key=?", (slot["checklist_type_id"], slot["item_key"] or slot["id"])).fetchall()]
                 self._compute_candidates(project_id, slot["id"], " ".join([slot["label"], *aliases]), 8)
                 with connect(self.db_path(project_id)) as db:
                     db.execute("UPDATE jobs SET current=?, message=?, updated_at=? WHERE id=?", (ordinal, f"正在匹配清单 {ordinal}/{len(slots)}：{slot['label']}", utcnow(), job_id))
-            selected = self.confirm_all_top_candidates(project_id)
+            self._deduplicate_system_confirmations(project_id, checklist_type_id)
+            selected = self.confirm_all_top_candidates(project_id, checklist_type_id)
             with connect(self.db_path(project_id)) as db:
                 db.execute("UPDATE jobs SET status='completed', message=?, updated_at=? WHERE id=?", (f"重新匹配完成，已自动选中 {selected['selected_count']} 个最高匹配照片", utcnow(), job_id))
         except Exception as exc:
@@ -473,13 +510,15 @@ class ProjectService:
     def _job_dict(row: sqlite3.Row, project_id: str) -> dict:
         return {"id": row["id"], "project_id": project_id, **dict(row)}
 
-    def list_slots(self, project_id: str) -> list[dict]:
+    def list_slots(self, project_id: str, checklist_type_id: str | None = None) -> list[dict]:
+        _, checklist_type_id = self._resolve_project_checklist(project_id, checklist_type_id)
         with connect(self.db_path(project_id)) as db:
             rows = db.execute(
                 """SELECT s.*,
                           COALESCE((SELECT COUNT(*) FROM candidates c WHERE c.slot_id=s.id),0) candidate_count,
                           (SELECT MAX(c.total_score) FROM candidates c WHERE c.slot_id=s.id) top_score
-                   FROM checklist_slots s ORDER BY ordinal"""
+                   FROM checklist_slots s WHERE s.checklist_type_id=? ORDER BY ordinal""",
+                (checklist_type_id,),
             ).fetchall()
             result = []
             for row in rows:
@@ -578,7 +617,7 @@ class ProjectService:
             self._compute_candidates(project_id, slot_id, slot["label"], max(8, top_k))
             with connect(self.db_path(project_id)) as db:
                 cached = db.execute("SELECT * FROM candidates WHERE slot_id=? ORDER BY rank LIMIT ?", (slot_id, top_k)).fetchall()
-        return self._present_candidates(project_id, cached)
+        return self._present_candidates(project_id, cached, slot["checklist_type_id"])
 
     def _query_vector(self, project_id: str, query: str) -> np.ndarray:
         normalized = " ".join(query.split()).strip().lower()
@@ -622,9 +661,11 @@ class ProjectService:
         matrix, rows = self._vectors_and_photo_rows(project_id)
         semantic = matrix @ query_vector
         with connect(self.db_path(project_id)) as db:
-            project = db.execute("SELECT checklist_type_id FROM project LIMIT 1").fetchone()
+            slot = db.execute("SELECT checklist_type_id FROM checklist_slots WHERE id=?", (slot_id,)).fetchone()
+            if not slot:
+                raise ValueError("清单项目不存在")
         with connect(self.settings.global_db) as global_db:
-            profile = global_db.execute("SELECT weights_json FROM preference_profiles WHERE name=?", (project["checklist_type_id"],)).fetchone()
+            profile = global_db.execute("SELECT weights_json FROM preference_profiles WHERE name=?", (slot["checklist_type_id"],)).fetchone()
         weights = {**DEFAULT_MATCH_WEIGHTS, **(json.loads(profile["weights_json"]) if profile else {})}
         semantic_weight = float(weights.get("semantic", DEFAULT_MATCH_WEIGHTS["semantic"]))
         quality_weight = float(weights.get("quality", DEFAULT_MATCH_WEIGHTS["quality"]))
@@ -654,24 +695,8 @@ class ProjectService:
                     "INSERT INTO candidates VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (slot_id, row["id"], semantic_score, row["quality_score"], total, rank, utcnow()),
                 )
-            # The user requested automatic selection for the same threshold shown as “高置信度” in the UI.
-            if (
-                ranked
-                and ranked[0][0] >= AUTO_CONFIRM_THRESHOLD
-                and ranked[0][1] >= AUTO_CONFIRM_MIN_SEMANTIC
-            ):
-                existing = db.execute("SELECT 1 FROM confirmations WHERE slot_id=?", (slot_id,)).fetchone()
-                rejected = db.execute(
-                    "SELECT 1 FROM rejections WHERE slot_id=? AND photo_id=?",
-                    (slot_id, ranked[0][2]["id"]),
-                ).fetchone()
-                if not existing and not rejected:
-                    db.execute(
-                        "INSERT INTO confirmations(slot_id, photo_id, confirmed_at, source, search_query, system_photo_id) VALUES (?, ?, ?, 'system', NULL, ?)",
-                        (slot_id, ranked[0][2]["id"], utcnow(), ranked[0][2]["id"]),
-                    )
 
-    def search(self, project_id: str, query: str, top_k: int) -> list[dict]:
+    def search(self, project_id: str, query: str, top_k: int, checklist_type_id: str | None = None) -> list[dict]:
         query_vector = self._query_vector(project_id, query)
         matrix, rows = self._vectors_and_photo_rows(project_id)
         semantic = matrix @ query_vector
@@ -686,9 +711,11 @@ class ProjectService:
         synthetic = []
         for rank, (score, semantic_score, row, ocr_hit) in enumerate(ranked[:top_k], start=1):
             synthetic.append({"photo_id": row["id"], "total_score": score, "semantic_score": semantic_score, "quality_score": row["quality_score"], "rank": rank, "ocr_hit": ocr_hit})
-        return self._present_candidates(project_id, synthetic)
+        return self._present_candidates(project_id, synthetic, checklist_type_id)
 
-    def _present_candidates(self, project_id: str, candidates: Iterable[sqlite3.Row | dict]) -> list[dict]:
+    def _present_candidates(
+        self, project_id: str, candidates: Iterable[sqlite3.Row | dict], checklist_type_id: str | None = None,
+    ) -> list[dict]:
         result: list[dict] = []
         with connect(self.db_path(project_id)) as db:
             for candidate in candidates:
@@ -696,7 +723,13 @@ class ProjectService:
                 photo = db.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone()
                 if not photo:
                     continue
-                used = db.execute("SELECT slot_id FROM confirmations WHERE photo_id=?", (photo_id,)).fetchall()
+                if checklist_type_id:
+                    used = db.execute(
+                        "SELECT c.slot_id FROM confirmations c JOIN checklist_slots s ON s.id=c.slot_id WHERE c.photo_id=? AND s.checklist_type_id=?",
+                        (photo_id, checklist_type_id),
+                    ).fetchall()
+                else:
+                    used = db.execute("SELECT slot_id FROM confirmations WHERE photo_id=?", (photo_id,)).fetchall()
                 result.append(
                     {
                         "photo_id": photo_id,
@@ -712,25 +745,31 @@ class ProjectService:
                 )
         return result
 
-    def confirm_all_top_candidates(self, project_id: str) -> dict:
+    def confirm_all_top_candidates(self, project_id: str, checklist_type_id: str | None = None) -> dict:
         """Confirm the best available candidates without reusing a photo automatically."""
-        self.project_root(project_id)
+        _, checklist_type_id = self._resolve_project_checklist(project_id, checklist_type_id)
         with connect(self.db_path(project_id)) as db:
             rows = db.execute(
                 """SELECT s.id AS slot_id, c.photo_id, c.total_score, c.rank
                    FROM checklist_slots s
                    JOIN candidates c ON c.slot_id=s.id
-                   WHERE NOT EXISTS (SELECT 1 FROM confirmations x WHERE x.slot_id=s.id)
+                   WHERE s.checklist_type_id=?
+                     AND NOT EXISTS (SELECT 1 FROM confirmations x WHERE x.slot_id=s.id)
                      AND NOT EXISTS (SELECT 1 FROM rejections r WHERE r.slot_id=s.id AND r.photo_id=c.photo_id)
-                   ORDER BY c.total_score DESC, c.rank ASC, s.ordinal"""
+                   ORDER BY c.total_score DESC, c.rank ASC, s.ordinal""",
+                (checklist_type_id,),
             ).fetchall()
             reserved_photo_ids = {
-                row["photo_id"] for row in db.execute("SELECT photo_id FROM confirmations")
+                row["photo_id"] for row in db.execute(
+                    "SELECT c.photo_id FROM confirmations c JOIN checklist_slots s ON s.id=c.slot_id WHERE s.checklist_type_id=? AND c.source='system'",
+                    (checklist_type_id,),
+                )
             }
             pending = int(db.execute(
-                "SELECT COUNT(*) FROM checklist_slots s WHERE NOT EXISTS (SELECT 1 FROM confirmations x WHERE x.slot_id=s.id)"
+                "SELECT COUNT(*) FROM checklist_slots s WHERE s.checklist_type_id=? AND NOT EXISTS (SELECT 1 FROM confirmations x WHERE x.slot_id=s.id)",
+                (checklist_type_id,),
             ).fetchone()[0])
-            total = int(db.execute("SELECT COUNT(*) FROM checklist_slots").fetchone()[0])
+            total = int(db.execute("SELECT COUNT(*) FROM checklist_slots WHERE checklist_type_id=?", (checklist_type_id,)).fetchone()[0])
         selected_rows = []
         selected_slot_ids: set[str] = set()
         for row in rows:
@@ -747,6 +786,29 @@ class ProjectService:
             "unmatched_count": max(0, pending - len(selected_rows)),
             "message": f"已为 {len(selected_rows)} 个未确认清单项选中不重复照片",
         }
+
+    def _deduplicate_system_confirmations(self, project_id: str, checklist_type_id: str) -> int:
+        """Remove stale duplicate auto-selections while preserving all manual choices."""
+        with connect(self.db_path(project_id)) as db:
+            rows = db.execute(
+                """SELECT c.slot_id, c.photo_id, c.confirmed_at, COALESCE(k.total_score, -999.0) AS total_score
+                   FROM confirmations c
+                   JOIN checklist_slots s ON s.id=c.slot_id
+                   LEFT JOIN candidates k ON k.slot_id=c.slot_id AND k.photo_id=c.photo_id
+                   WHERE s.checklist_type_id=? AND c.source='system'
+                   ORDER BY c.photo_id, total_score DESC, c.confirmed_at ASC""",
+                (checklist_type_id,),
+            ).fetchall()
+            retained_photo_ids: set[str] = set()
+            duplicate_slot_ids: list[str] = []
+            for row in rows:
+                if row["photo_id"] in retained_photo_ids:
+                    duplicate_slot_ids.append(row["slot_id"])
+                else:
+                    retained_photo_ids.add(row["photo_id"])
+            for slot_id in duplicate_slot_ids:
+                db.execute("DELETE FROM confirmations WHERE slot_id=? AND source='system'", (slot_id,))
+        return len(duplicate_slot_ids)
 
     def confirm(self, project_id: str, slot_id: str, photo_ids: list[str], source: str = "manual", search_query: str | None = None) -> None:
         root = self.project_root(project_id)
@@ -768,7 +830,7 @@ class ProjectService:
                     (slot_id, photo_id, utcnow(), source, search_query, system["photo_id"] if system else photo_id),
                 )
                 if source == "manual" and system and system["photo_id"] != photo_id:
-                    checklist_type = db.execute("SELECT checklist_type_id FROM project LIMIT 1").fetchone()["checklist_type_id"]
+                    checklist_type = db.execute("SELECT checklist_type_id FROM checklist_slots WHERE id=?", (slot_id,)).fetchone()["checklist_type_id"]
                     exists = db.execute("SELECT 1 FROM preference_feedback WHERE slot_id=? AND applied=0", (slot_id,)).fetchone()
                     if not exists:
                         db.execute(
@@ -816,18 +878,10 @@ class ProjectService:
                 raise ValueError("当前项目仍有任务运行，暂不能导入用户反馈")
             if db.execute("SELECT 1 FROM feedback_imports WHERE source_sha256=?", (source_sha256,)).fetchone():
                 raise ValueError("这份用户反馈已经导入过")
-            slots = db.execute(
-                "SELECT id, sheet_name, image_cell FROM checklist_slots ORDER BY ordinal",
+            feedback_cells = image_cells
+            batches = db.execute(
+                "SELECT id, output_relative_path, checklist_type_id FROM export_batches ORDER BY created_at DESC"
             ).fetchall()
-            if not slots:
-                raise ValueError("当前项目没有可导入反馈的清单字段")
-            required_sheets = {slot["sheet_name"] for slot in slots}
-            if not required_sheets.issubset(set(workbook.sheetnames)):
-                raise ValueError("该 Excel 缺少质量清单工作表，请确认导入的是本系统导出的清单")
-
-            slot_cells = {(slot["sheet_name"], slot["image_cell"]): slot["id"] for slot in slots}
-            feedback_cells = image_cells.intersection(slot_cells)
-            batches = db.execute("SELECT id, output_relative_path FROM export_batches ORDER BY created_at DESC").fetchall()
             # Users commonly append “修改” to the exported filename. Keep the
             # timestamp as a stable link to the exact original export when it
             # is still present; otherwise use the image-cell overlap fallback.
@@ -860,6 +914,9 @@ class ProjectService:
                     best_batch, best_output_name, best_items, best_overlap = batch["id"], Path(batch["output_relative_path"]).name, items, overlap
             if not best_batch or not best_items:
                 raise ValueError("未找到可对应的原始导出批次。请使用升级后重新导出的清单收集用户反馈")
+            required_sheets = {item["sheet_name"] for item in best_items}
+            if not required_sheets.issubset(set(workbook.sheetnames)):
+                raise ValueError("该 Excel 缺少对应清单工作表，请确认导入的是本系统导出的清单")
 
             import_id = str(uuid.uuid4())
             db.execute(
@@ -910,16 +967,50 @@ class ProjectService:
             if changed != 1:
                 raise ValueError("清单项目不存在")
 
-    def export_preflight(self, project_id: str) -> dict:
-        self.project_root(project_id)
+    def export_preflight(self, project_id: str, checklist_type_id: str | None = None) -> dict:
+        _, checklist_type_id = self._resolve_project_checklist(project_id, checklist_type_id)
         with connect(self.db_path(project_id)) as db:
             project = db.execute("SELECT factory_name, checklist_type_id FROM project LIMIT 1").fetchone()
-            total = int(db.execute("SELECT COUNT(*) FROM checklist_slots").fetchone()[0])
-            selected = int(db.execute("SELECT COUNT(DISTINCT slot_id) FROM confirmations").fetchone()[0])
-            overrides = int(db.execute("SELECT COUNT(*) FROM confirmations WHERE source='manual' AND system_photo_id != photo_id").fetchone()[0])
-            pending_aliases = int(db.execute("SELECT COUNT(*) FROM pending_aliases WHERE confirmed_at IS NULL").fetchone()[0])
+            total = int(db.execute("SELECT COUNT(*) FROM checklist_slots WHERE checklist_type_id=?", (checklist_type_id,)).fetchone()[0])
+            selected = int(db.execute(
+                "SELECT COUNT(DISTINCT c.slot_id) FROM confirmations c JOIN checklist_slots s ON s.id=c.slot_id WHERE s.checklist_type_id=?",
+                (checklist_type_id,),
+            ).fetchone()[0])
+            overrides = int(db.execute(
+                "SELECT COUNT(*) FROM confirmations c JOIN checklist_slots s ON s.id=c.slot_id WHERE s.checklist_type_id=? AND c.source='manual' AND c.system_photo_id != c.photo_id",
+                (checklist_type_id,),
+            ).fetchone()[0])
+            pending_aliases = int(db.execute(
+                "SELECT COUNT(*) FROM pending_aliases WHERE checklist_type_id=? AND confirmed_at IS NULL",
+                (checklist_type_id,),
+            ).fetchone()[0])
             jobs = db.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
-            feedback_records = int(db.execute("SELECT COUNT(*) FROM feedback_events").fetchone()[0])
+            feedback_records = int(db.execute(
+                "SELECT COUNT(*) FROM feedback_events e JOIN checklist_slots s ON s.id=e.slot_id WHERE s.checklist_type_id=?",
+                (checklist_type_id,),
+            ).fetchone()[0])
+        training_feedback = 0
+        training_history = 0
+        for database in self.settings.projects_root.glob("*/project.sqlite"):
+            try:
+                with connect(database) as training_db:
+                    training_feedback += int(training_db.execute(
+                        "SELECT COUNT(*) FROM feedback_events e JOIN checklist_slots s ON s.id=e.slot_id WHERE s.checklist_type_id=?",
+                        (checklist_type_id,),
+                    ).fetchone()[0])
+                    training_history += int(training_db.execute(
+                        "SELECT COUNT(*) FROM history_matches h JOIN checklist_slots s ON s.id=h.matched_slot_id WHERE h.photo_id IS NOT NULL AND h.matched_slot_id IS NOT NULL AND s.checklist_type_id=?",
+                        (checklist_type_id,),
+                    ).fetchone()[0])
+            except sqlite3.Error:
+                # A legacy or partially migrated project must not hide readiness
+                # for the healthy projects that still contain usable feedback.
+                continue
+        training_data_count = training_feedback + training_history
+        training_data_threshold = self.settings.training_feedback_threshold
+        training_ready = training_data_count >= training_data_threshold
+        training_remaining = max(0, training_data_threshold - training_data_count)
+        training_progress_percent = min(100, round(training_data_count / training_data_threshold * 100))
         return {
             "ready": True,
             "total_slots": total,
@@ -928,15 +1019,22 @@ class ProjectService:
             "active_overrides": overrides,
             "pending_aliases": pending_aliases,
             "feedback_records": feedback_records,
+            "training_data_count": training_data_count,
+            "training_feedback_count": training_feedback,
+            "training_history_count": training_history,
+            "training_data_threshold": training_data_threshold,
+            "training_remaining": training_remaining,
+            "training_progress_percent": training_progress_percent,
+            "training_ready": training_ready,
             "active_jobs": int(jobs),
             "message": f"已积累 {feedback_records} 条有效反馈；本次主动换图 {overrides} 项；发现 {pending_aliases} 个待确认别名。",
             "allow_partial": True,
             "factory_name": project["factory_name"],
-            "checklist_type_id": project["checklist_type_id"],
+            "checklist_type_id": checklist_type_id,
         }
 
-    def export_excel(self, project_id: str, allow_partial: bool = True) -> dict:
-        root = self.project_root(project_id)
+    def export_excel(self, project_id: str, allow_partial: bool = True, checklist_type_id: str | None = None) -> dict:
+        root, checklist_type_id = self._resolve_project_checklist(project_id, checklist_type_id)
         with connect(self.db_path(project_id)) as db:
             project = db.execute("SELECT factory_name, checklist_type_id FROM project LIMIT 1").fetchone()
             rows = db.execute(
@@ -944,21 +1042,22 @@ class ProjectService:
                           c.system_photo_id, k.semantic_score, k.quality_score, k.total_score, k.rank
                    FROM checklist_slots s JOIN confirmations c ON c.slot_id=s.id JOIN photos p ON p.id=c.photo_id
                    LEFT JOIN candidates k ON k.slot_id=s.id AND k.photo_id=c.photo_id
-                   ORDER BY s.ordinal"""
+                   WHERE s.checklist_type_id=? ORDER BY s.ordinal""",
+                (checklist_type_id,),
             ).fetchall()
-            total = int(db.execute("SELECT COUNT(*) FROM checklist_slots").fetchone()[0])
+            total = int(db.execute("SELECT COUNT(*) FROM checklist_slots WHERE checklist_type_id=?", (checklist_type_id,)).fetchone()[0])
         if not allow_partial and len(rows) < total:
             raise ValueError(f"尚有 {total - len(rows)} 个清单项未选图")
         selections = {row["item_key"]: self._safe_relative(root, row["relative_path"]) for row in rows}
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        output = root / "outputs" / f"{project['factory_name']}__{project['checklist_type_id']}__{stamp}.xlsx"
-        result = export_workbook(project["checklist_type_id"], selections, output)
+        output = root / "outputs" / f"{project['factory_name']}__{checklist_type_id}__{stamp}.xlsx"
+        result = export_workbook(checklist_type_id, selections, output)
         export_id = str(uuid.uuid4())
         with connect(self.db_path(project_id)) as db:
-            pending_feedback = db.execute("SELECT * FROM preference_feedback WHERE applied=0").fetchall()
+            pending_feedback = db.execute("SELECT * FROM preference_feedback WHERE checklist_type_id=? AND applied=0", (checklist_type_id,)).fetchall()
             batch_overrides = len(pending_feedback)
-            batch_aliases = int(db.execute("SELECT COUNT(*) FROM pending_aliases WHERE confirmed_at IS NULL").fetchone()[0])
-            db.execute("INSERT INTO export_batches(id, output_relative_path, created_at) VALUES (?, ?, ?)", (export_id, output.relative_to(root).as_posix(), utcnow()))
+            batch_aliases = int(db.execute("SELECT COUNT(*) FROM pending_aliases WHERE checklist_type_id=? AND confirmed_at IS NULL", (checklist_type_id,)).fetchone()[0])
+            db.execute("INSERT INTO export_batches(id, output_relative_path, checklist_type_id, created_at) VALUES (?, ?, ?, ?)", (export_id, output.relative_to(root).as_posix(), checklist_type_id, utcnow()))
             for row in rows:
                 db.execute(
                     """INSERT INTO export_batch_items(export_id, slot_id, selected_photo_id, system_photo_id, semantic_score, quality_score, total_score, rank)
@@ -971,17 +1070,20 @@ class ProjectService:
                        VALUES (?, ?, ?, ?, ?, 'replaced', 'manual', ?)""",
                     (str(uuid.uuid4()), export_id, feedback["slot_id"], feedback["system_photo_id"], feedback["selected_photo_id"], utcnow()),
                 )
-            db.execute("UPDATE preference_feedback SET applied=1, export_id=? WHERE applied=0", (export_id,))
-            db.execute("UPDATE pending_aliases SET confirmed_at=? WHERE confirmed_at IS NULL", (utcnow(),))
-            aliases = db.execute("SELECT checklist_type_id, item_key, alias FROM pending_aliases WHERE confirmed_at IS NOT NULL AND alias != ''").fetchall()
-            feedback_count = int(db.execute("SELECT COUNT(*) FROM feedback_events").fetchone()[0])
+            db.execute("UPDATE preference_feedback SET applied=1, export_id=? WHERE checklist_type_id=? AND applied=0", (export_id, checklist_type_id))
+            db.execute("UPDATE pending_aliases SET confirmed_at=? WHERE checklist_type_id=? AND confirmed_at IS NULL", (utcnow(), checklist_type_id))
+            aliases = db.execute("SELECT checklist_type_id, item_key, alias FROM pending_aliases WHERE checklist_type_id=? AND confirmed_at IS NOT NULL AND alias != ''", (checklist_type_id,)).fetchall()
+            feedback_count = int(db.execute(
+                "SELECT COUNT(*) FROM feedback_events e JOIN checklist_slots s ON s.id=e.slot_id WHERE s.checklist_type_id=?",
+                (checklist_type_id,),
+            ).fetchone()[0])
         with connect(self.settings.global_db) as global_db:
             for alias in aliases:
                 global_db.execute(
                     "INSERT OR IGNORE INTO checklist_aliases(checklist_type_id, item_key, alias, source) VALUES (?, ?, ?, 'search')",
                     (alias["checklist_type_id"], alias["item_key"], alias["alias"]),
                 )
-        result.update(self.export_preflight(project_id))
+        result.update(self.export_preflight(project_id, checklist_type_id))
         result.update({"export_id": export_id, "output_path": str(output), "feedback_records": feedback_count, "message": f"本次主动换图 {batch_overrides} 项；已积累有效反馈 {feedback_count} 条；发现 {batch_aliases} 个待确认别名；缺图 {result.get('missing_count', 0)} 项。"})
         return result
 

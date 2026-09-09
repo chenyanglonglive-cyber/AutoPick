@@ -104,6 +104,15 @@ button.secondary:hover:not(:disabled) {
   gap: 10px;
 }
 
+.brand-version {
+  padding: 2px 6px;
+  border: 1px solid #bfd0f0;
+  border-radius: 999px;
+  color: #47638e;
+  font-size: 11px;
+  font-weight: 700;
+}
+
 .export-top {
   background: #107c41;
 }
@@ -435,6 +444,29 @@ button.secondary:hover:not(:disabled) {
 .slots-scroll button.confidence-line-high {
   border-left: 3px solid #16a34a;
   background: #f1fcf5;
+}
+
+.checklist-selector-wrap {
+  min-width: 0;
+}
+
+.checklist-selector-wrap label {
+  display: block;
+  margin-bottom: 3px;
+  color: #6f7d92;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.checklist-selector-wrap select {
+  max-width: 290px;
+  padding: 5px 26px 5px 8px;
+  border: 1px solid #b9cae8;
+  border-radius: 6px;
+  background: #fff;
+  color: #1f3560;
+  font-size: 13px;
+  font-weight: 700;
 }
 
 .slots-scroll button.confidence-line-medium {
@@ -1037,6 +1069,58 @@ button.secondary:hover:not(:disabled) {
 .coverage-card.ready strong { color: #107c41; }
 .coverage-card p { margin: 5px 0; font-size: 11px; line-height: 1.45; color: #4d5b70; }
 .coverage-card small { color: #8a4b00; font-size: 10.5px; line-height: 1.35; }
+
+.training-readiness-card {
+  border: 1px solid #b9c9e5;
+  background: #f5f8fd;
+  border-radius: 8px;
+  padding: 11px 10px;
+  margin: 10px 0 0;
+}
+
+.training-readiness-card.ready {
+  border-color: #86d5ad;
+  background: #edf9f2;
+}
+
+.training-readiness-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  color: #16335f;
+  font-size: 12px;
+}
+
+.training-readiness-heading span {
+  color: #47658f;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.training-progress-track {
+  height: 9px;
+  margin: 9px 0 7px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: repeating-linear-gradient(90deg, #dce5f2 0, #dce5f2 calc(10% - 1px), #f5f8fd calc(10% - 1px), #f5f8fd 10%);
+}
+
+.training-progress-track i {
+  display: block;
+  height: 100%;
+  background: #2f6fce;
+  transition: width 0.35s ease;
+}
+
+.training-readiness-card.ready .training-progress-track i { background: #168552; }
+.training-readiness-card p { margin: 0 0 4px; color: #4d5b70; font-size: 10.5px; line-height: 1.4; }
+.training-readiness-card small { color: #728198; font-size: 10px; }
+.training-readiness-card .training-ready-message { color: #0c6b3d; font-weight: 800; }
+
+@media (prefers-reduced-motion: reduce) {
+  .training-progress-track i { transition: none; }
+}
 
 .btn-select-all {
   width: 100%;

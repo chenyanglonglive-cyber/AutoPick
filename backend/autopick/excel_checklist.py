@@ -5,6 +5,7 @@ import json
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -19,6 +20,8 @@ from openpyxl.utils.units import pixels_to_EMU
 RESOURCE_ROOT = Path(__file__).resolve().parents[2] / "resources" / "checklists"
 QUALITY_RESOURCE = RESOURCE_ROOT / "quality_v1" / "Quality list.xlsx"
 QUALITY_SHA256 = "EC05C7B51702527E519AC8A112CC51A05D69ED95CF194637D5F7ED27D104C8BF"
+SOCIAL_AUDIT_RESOURCE = RESOURCE_ROOT / "social_audit_v1" / "Social Audit Checklist.xlsx"
+SOCIAL_AUDIT_SHA256 = "2E7E44E3F4636853D791561EC9054243AF21E1332D963254912DAB650181C909"
 
 
 @dataclass(frozen=True)
@@ -88,13 +91,64 @@ def _build_quality_slots(path: Path) -> tuple[ChecklistSlotSpec, ...]:
     return tuple(slots)
 
 
-def checklist_types() -> list[ChecklistType]:
+def _build_social_audit_slots(path: Path) -> tuple[ChecklistSlotSpec, ...]:
+    """Return only the photo fields explicitly reserved in the social template."""
+    workbook = load_workbook(path, read_only=False, data_only=False)
+    ws = workbook["Sheet1"]
+    slots: list[ChecklistSlotSpec] = []
+    occurrences: dict[str, int] = {}
+    part = ""
+
+    for row in range(1, ws.max_row + 1):
+        cells = [ws.cell(row, column) for column in range(2, 5)]
+        for cell in cells:
+            if cell.style_id != 1 or cell.value is None:
+                continue
+            heading = str(cell.value).strip()
+            if heading.lower().startswith("part "):
+                part = heading
+
+        for cell in cells:
+            if cell.value is None or cell.style_id not in {6, 9}:
+                continue
+            image_row = cell.row + 1
+            image_cell = ws.cell(image_row, cell.column)
+            # The source template uses 180-point blank rows for photo evidence.
+            # Other styled labels are reference-only entries and must stay text-only.
+            if image_cell.value is not None or (ws.row_dimensions[image_row].height or 0) < 100:
+                continue
+            label = str(cell.value).strip()
+            if not label:
+                continue
+            occurrences[label] = occurrences.get(label, 0) + 1
+            item_key = f"social_audit_v1/{part or 'default'}/{cell.coordinate}/{occurrences[label]}"
+            slots.append(ChecklistSlotSpec(item_key, len(slots) + 1, part, label, ws.title, cell.coordinate, image_cell.coordinate))
+
+    if len(slots) != 36:
+        raise ValueError(f"固定社会审核清单应有 36 个图片字段，实际发现 {len(slots)} 个")
+    return tuple(slots)
+
+
+@lru_cache(maxsize=1)
+def _registered_checklist_types() -> tuple[ChecklistType, ...]:
     if not QUALITY_RESOURCE.is_file():
         raise FileNotFoundError(f"内置清单资源不存在: {QUALITY_RESOURCE}")
-    digest = _sha256(QUALITY_RESOURCE)
-    if digest != QUALITY_SHA256:
+    quality_digest = _sha256(QUALITY_RESOURCE)
+    if quality_digest != QUALITY_SHA256:
         raise ValueError("Quality list.xlsx 校验失败，可能被意外修改")
-    return [ChecklistType("quality_v1", "Quality list（质量审核）", "1", QUALITY_RESOURCE, digest, _build_quality_slots(QUALITY_RESOURCE))]
+    if not SOCIAL_AUDIT_RESOURCE.is_file():
+        raise FileNotFoundError(f"内置清单资源不存在: {SOCIAL_AUDIT_RESOURCE}")
+    social_audit_digest = _sha256(SOCIAL_AUDIT_RESOURCE)
+    if social_audit_digest != SOCIAL_AUDIT_SHA256:
+        raise ValueError("Social Audit Checklist.xlsx 校验失败，可能被意外修改")
+    return (
+        ChecklistType("quality_v1", "Quality Checklist", "1", QUALITY_RESOURCE, quality_digest, _build_quality_slots(QUALITY_RESOURCE)),
+        ChecklistType("social_audit_v1", "Social Audit Checklist", "1", SOCIAL_AUDIT_RESOURCE, social_audit_digest, _build_social_audit_slots(SOCIAL_AUDIT_RESOURCE)),
+    )
+
+
+def checklist_types() -> list[ChecklistType]:
+    return list(_registered_checklist_types())
 
 
 def get_checklist_type(type_id: str) -> ChecklistType:
@@ -145,7 +199,6 @@ def export_workbook(type_id: str, selections: dict[str, Path], output_path: Path
     output_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(checklist.resource_path, output_path)
     workbook = load_workbook(output_path)
-    ws = workbook["Photo report Tool"]
     inserted = 0
     missing: list[str] = []
     for slot in checklist.slots:
@@ -153,7 +206,7 @@ def export_workbook(type_id: str, selections: dict[str, Path], output_path: Path
         if not image_path or not image_path.is_file():
             missing.append(slot.item_key)
             continue
-        _add_centered_image(ws, slot.image_cell, image_path)
+        _add_centered_image(workbook[slot.sheet_name], slot.image_cell, image_path)
         inserted += 1
     workbook.save(output_path)
     return {"output_path": str(output_path), "inserted_count": inserted, "missing_count": len(missing), "missing_item_keys": missing}

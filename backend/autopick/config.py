@@ -18,6 +18,7 @@ class Settings:
     ocr_model: str = "qwen-vl-ocr"
     token_budget: int = 500_000
     qwen_max_retries: int = 8
+    training_feedback_threshold: int = 500
 
     @property
     def global_db(self) -> Path:
@@ -52,4 +53,5 @@ def load_settings() -> Settings:
         demo_embeddings=os.getenv("AUTOPICK_DEMO_EMBEDDINGS", "0") == "1",
         session_token=secrets.token_urlsafe(32),
         qwen_max_retries=max(1, int(os.getenv("AUTOPICK_QWEN_MAX_RETRIES", "8"))),
+        training_feedback_threshold=max(1, int(os.getenv("AUTOPICK_TRAINING_FEEDBACK_THRESHOLD", "500"))),
     )

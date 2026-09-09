@@ -266,6 +266,7 @@ CREATE TABLE IF NOT EXISTS pending_aliases (
 CREATE TABLE IF NOT EXISTS export_batches (
     id TEXT PRIMARY KEY,
     output_relative_path TEXT NOT NULL,
+    checklist_type_id TEXT NOT NULL DEFAULT 'quality_v1',
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS export_batch_items (
@@ -319,15 +320,16 @@ def initialize_global(path: Path) -> None:
         # Keep the original profile table compatible while making the type
         # identifier the stable key for the fixed checklist registry.
         default_weights = '{"semantic":0.62,"quality":0.10,"ocr":0.28}'
-        connection.execute(
-            "INSERT OR IGNORE INTO preference_profiles(name, weights_json, version) VALUES ('quality_v1', ?, 1)",
-            (default_weights,),
-        )
+        for checklist_type_id in ("quality_v1", "social_audit_v1"):
+            connection.execute(
+                "INSERT OR IGNORE INTO preference_profiles(name, weights_json, version) VALUES (?, ?, 1)",
+                (checklist_type_id, default_weights),
+            )
         # Feedback is now accumulated for a later validated training run. The
         # old fixed-step adjustment was not learned from the actual feedback,
-        # so reset every existing quality_v1 profile to the stable baseline.
+        # so reset every fixed checklist profile to the stable baseline.
         connection.execute(
-            "UPDATE preference_profiles SET weights_json=?, version=1, updated_at=CURRENT_TIMESTAMP WHERE name='quality_v1'",
+            "UPDATE preference_profiles SET weights_json=?, version=1, updated_at=CURRENT_TIMESTAMP WHERE name IN ('quality_v1', 'social_audit_v1')",
             (default_weights,),
         )
 
@@ -350,3 +352,4 @@ def initialize_project(path: Path) -> None:
         add_column("confirmations", "source", "TEXT NOT NULL DEFAULT 'system'")
         add_column("confirmations", "search_query", "TEXT")
         add_column("confirmations", "system_photo_id", "TEXT")
+        add_column("export_batches", "checklist_type_id", "TEXT NOT NULL DEFAULT 'quality_v1'")
