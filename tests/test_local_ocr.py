@@ -167,5 +167,22 @@ def test_combined_gallery_processing_queues_one_vector_and_ocr_pipeline(tmp_path
     service._jobs[job["id"]].join(timeout=2)
 
     assert job["kind"] == "gallery_processing"
-    assert job["total"] == 2 + 2 + len(service.list_slots(project["id"]))
+    assert job["total"] == 2
+    assert job["message"] == "等待开始图片向量化"
     assert calls == [(project["id"], job["id"], True)]
+
+
+def test_gallery_processing_can_be_cancelled_without_discarding_completed_work(tmp_path: Path, monkeypatch) -> None:
+    settings = Settings(tmp_path / "data", None, True, "test-token")
+    service = ProjectService(settings)
+    gallery = tmp_path / "gallery"
+    gallery.mkdir()
+    Image.new("RGB", (120, 80), (10, 20, 30)).save(gallery / "a.jpg", "JPEG")
+    project = service.create_project("Factory", str(gallery), checklist_type_id="quality_v1")
+
+    monkeypatch.setattr(service, "_index_worker", lambda *_: None)
+    job = service.start_gallery_processing(project["id"])
+    cancelled = service.cancel_job(project["id"], job["id"])
+
+    assert cancelled["status"] == "cancelling"
+    assert "保留" in cancelled["message"]

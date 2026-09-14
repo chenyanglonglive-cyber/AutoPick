@@ -33,6 +33,7 @@ export const api = {
   processGallery: (id: string) => request<any>(`/api/projects/${id}/gallery/process`, { method: 'POST' }),
   match: (id: string, checklistTypeId: string) => request<any>(`/api/projects/${id}/match?checklist_type_id=${encodeURIComponent(checklistTypeId)}`, { method: 'POST' }),
   job: (id: string, jobId: string) => request<any>(`/api/projects/${id}/jobs/${jobId}`),
+  cancelJob: (id: string, jobId: string) => request<any>(`/api/projects/${id}/jobs/${jobId}/cancel`, { method: 'POST' }),
   checklist: (id: string, checklistTypeId: string) => request<Slot[]>(`/api/projects/${id}/checklist?checklist_type_id=${encodeURIComponent(checklistTypeId)}`),
   gallery: (id: string) => request<GalleryPhoto[]>(`/api/projects/${id}/gallery`),
   gallerySearch: (id: string, query: string) => request<GalleryPhoto[]>(`/api/projects/${id}/gallery/search`, { method: 'POST', body: JSON.stringify({ query, top_k: 120 }) }),

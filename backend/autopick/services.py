@@ -48,6 +48,10 @@ class ProjectNotFoundError(FileNotFoundError):
     pass
 
 
+class JobCancelled(RuntimeError):
+    pass
+
+
 class ProjectService:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -346,7 +350,7 @@ class ProjectService:
         return self.get_job(project_id, job_id)
 
     def start_gallery_processing(self, project_id: str) -> dict:
-        """Queue one non-blocking pipeline for new image vectors, OCR and matching."""
+        """Queue one non-blocking pipeline for all unprocessed image vectors, OCR and matching."""
         root = self.project_root(project_id)
         self._copy_exact_duplicate_ocr(project_id)
         with connect(self.db_path(project_id)) as db:
@@ -373,13 +377,35 @@ class ProjectService:
             slot_count = int(db.execute("SELECT COUNT(*) FROM checklist_slots").fetchone()[0])
             job_id = str(uuid.uuid4())
             db.execute(
-                "INSERT INTO jobs VALUES (?, 'gallery_processing', 'queued', 0, ?, '等待处理新增图片', ?, 0, ?, ?)",
-                (job_id, len(vector_rows) + len(ocr_rows) + slot_count, estimate, utcnow(), utcnow()),
+                "INSERT INTO jobs VALUES (?, 'gallery_processing', 'queued', 0, ?, '等待开始图片向量化', ?, 0, ?, ?)",
+                (job_id, len(vector_rows), estimate, utcnow(), utcnow()),
             )
         thread = threading.Thread(target=self._index_worker, args=(project_id, job_id, True), daemon=True)
         self._jobs[job_id] = thread
         thread.start()
         return self.get_job(project_id, job_id)
+
+    def cancel_job(self, project_id: str, job_id: str) -> dict:
+        """Request a safe stop between individual image or checklist operations."""
+        with connect(self.db_path(project_id)) as db:
+            job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not job:
+                raise ValueError("任务不存在")
+            if job["kind"] != "gallery_processing":
+                raise ValueError("只有图片向量化 + OCR 任务可以在此处停止")
+            if job["status"] in {"completed", "failed", "cancelled", "interrupted"}:
+                return self._job_dict(job, project_id)
+            db.execute(
+                "UPDATE jobs SET status='cancelling', message='正在停止处理；当前图片完成后将保留已有结果', updated_at=? WHERE id=?",
+                (utcnow(), job_id),
+            )
+        return self.get_job(project_id, job_id)
+
+    def _raise_if_job_cancelled(self, project_id: str, job_id: str) -> None:
+        with connect(self.db_path(project_id)) as db:
+            row = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row and row["status"] == "cancelling":
+            raise JobCancelled()
 
     def _index_worker(self, project_id: str, job_id: str, include_ocr: bool = False) -> None:
         root = self.project_root(project_id)
@@ -391,12 +417,14 @@ class ProjectService:
             max_retries=self.settings.qwen_max_retries,
         ) as client:
             try:
+                self._raise_if_job_cancelled(project_id, job_id)
                 with connect(self.db_path(project_id)) as db:
-                    db.execute("UPDATE jobs SET status='running', message='正在生成图片向量', updated_at=? WHERE id=?", (utcnow(), job_id))
+                    db.execute("UPDATE jobs SET status='running', current=0, message='图片向量化：准备处理待处理图片', updated_at=? WHERE id=?", (utcnow(), job_id))
                     rows = db.execute(
                         "SELECT p.* FROM photos p LEFT JOIN embeddings e ON e.photo_id=p.id WHERE e.photo_id IS NULL AND p.duplicate_of IS NULL ORDER BY p.created_at"
                     ).fetchall()
                 for ordinal, row in enumerate(rows, start=1):
+                    self._raise_if_job_cancelled(project_id, job_id)
                     original = self.safe_photo_path(project_id, row["id"])
                     derivative = root / "derived" / "embedding" / f"{row['id']}__{row['source_filename']}.jpg"
                     make_derivative(original, derivative, 1024, 82)
@@ -424,18 +452,22 @@ class ProjectService:
                         )
                         db.execute(
                             "UPDATE jobs SET current=?, actual_tokens=actual_tokens+?, message=?, updated_at=? WHERE id=?",
-                            (ordinal, result.input_tokens, f"已处理 {ordinal}/{len(rows)} 张图片", utcnow(), job_id),
+                            (ordinal, result.input_tokens, f"图片向量化：{ordinal}/{len(rows)} 张待处理图片", utcnow(), job_id),
                         )
+                self._raise_if_job_cancelled(project_id, job_id)
                 self._copy_exact_duplicate_vectors(project_id)
-                processed_image_steps = len(rows)
                 if include_ocr:
                     with connect(self.db_path(project_id)) as db:
-                        db.execute("UPDATE jobs SET message='正在建立新增图片的本地文字索引', updated_at=? WHERE id=?", (utcnow(), job_id))
                         ocr_rows = db.execute(
                             "SELECT p.* FROM photos p LEFT JOIN ocr_results o ON o.photo_id=p.id WHERE o.photo_id IS NULL AND p.duplicate_of IS NULL ORDER BY p.created_at"
                         ).fetchall()
+                        db.execute(
+                            "UPDATE jobs SET current=0, total=?, message='本地 OCR：准备识别待处理图片', updated_at=? WHERE id=?",
+                            (len(ocr_rows), utcnow(), job_id),
+                        )
                     ocr_client = LocalOcrClient()
                     for ordinal, row in enumerate(ocr_rows, start=1):
+                        self._raise_if_job_cancelled(project_id, job_id)
                         original = self.safe_photo_path(project_id, row["id"])
                         derivative = root / "derived" / "ocr" / f"{row['id']}__{row['source_filename']}.jpg"
                         make_derivative(original, derivative, 1600, 90)
@@ -444,14 +476,23 @@ class ProjectService:
                             db.execute("INSERT OR REPLACE INTO ocr_results VALUES (?, ?, ?)", (row["id"], text, utcnow()))
                             db.execute(
                                 "UPDATE jobs SET current=?, message=?, updated_at=? WHERE id=?",
-                                (len(rows) + ordinal, f"本地 OCR 已识别 {ordinal}/{len(ocr_rows)} 张新增图片", utcnow(), job_id),
+                                (ordinal, f"本地 OCR：{ordinal}/{len(ocr_rows)} 张待处理图片", utcnow(), job_id),
                             )
+                    self._raise_if_job_cancelled(project_id, job_id)
                     self._copy_exact_duplicate_ocr(project_id)
-                    processed_image_steps += len(ocr_rows)
+                else:
+                    processed_image_steps = len(rows)
                 with connect(self.db_path(project_id)) as db:
-                    db.execute("UPDATE jobs SET message='开始按清单匹配候选照片', updated_at=? WHERE id=?", (utcnow(), job_id))
                     slots = db.execute("SELECT id, label, item_key, checklist_type_id FROM checklist_slots ORDER BY ordinal").fetchall()
+                    if include_ocr:
+                        db.execute(
+                            "UPDATE jobs SET current=0, total=?, message='清单匹配：准备重新计算候选照片', updated_at=? WHERE id=?",
+                            (len(slots), utcnow(), job_id),
+                        )
+                    else:
+                        db.execute("UPDATE jobs SET message='开始按清单匹配候选照片', updated_at=? WHERE id=?", (utcnow(), job_id))
                 for ordinal, slot in enumerate(slots, start=1):
+                    self._raise_if_job_cancelled(project_id, job_id)
                     try:
                         with connect(self.settings.global_db) as global_db:
                             aliases = [row["alias"] for row in global_db.execute("SELECT alias FROM checklist_aliases WHERE checklist_type_id=? AND item_key=?", (slot["checklist_type_id"], slot["item_key"] or slot["id"])).fetchall()]
@@ -463,21 +504,28 @@ class ProjectService:
                         db.execute(
                             "UPDATE jobs SET current=?, total=?, message=?, updated_at=? WHERE id=?",
                             (
-                                processed_image_steps + ordinal,
-                                processed_image_steps + len(slots),
-                                f"正在匹配清单 {ordinal}/{len(slots)}：{slot['label']}",
+                                ordinal if include_ocr else processed_image_steps + ordinal,
+                                len(slots) if include_ocr else processed_image_steps + len(slots),
+                                f"清单匹配：{ordinal}/{len(slots)} · {slot['label']}" if include_ocr else f"正在匹配清单 {ordinal}/{len(slots)}：{slot['label']}",
                                 utcnow(),
                                 job_id,
                             ),
                         )
+                self._raise_if_job_cancelled(project_id, job_id)
                 for checklist_type_id in {slot["checklist_type_id"] for slot in slots}:
                     self._clear_unsuitable_system_confirmations(project_id, checklist_type_id)
                     self._deduplicate_system_confirmations(project_id, checklist_type_id)
                     self.confirm_all_top_candidates(project_id, checklist_type_id)
                 with connect(self.db_path(project_id)) as db:
-                    completion_message = '新增图片的向量、OCR 与清单匹配已全部完成' if include_ocr else '图片向量化与清单匹配已全部完成'
+                    completion_message = '图片向量化、OCR 与清单匹配已全部完成' if include_ocr else '图片向量化与清单匹配已全部完成'
                     db.execute("UPDATE jobs SET status='completed', message=?, updated_at=? WHERE id=?", (completion_message, utcnow(), job_id))
                     db.execute("UPDATE project SET status='indexed'")
+            except JobCancelled:
+                with connect(self.db_path(project_id)) as db:
+                    db.execute(
+                        "UPDATE jobs SET status='cancelled', message='处理已停止；已完成的向量和 OCR 已保留，可再次点击继续', updated_at=? WHERE id=?",
+                        (utcnow(), job_id),
+                    )
             except Exception as exc:
                 with connect(self.db_path(project_id)) as db:
                     db.execute("UPDATE jobs SET status='failed', message=?, updated_at=? WHERE id=?", (str(exc)[:1000], utcnow(), job_id))

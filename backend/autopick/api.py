@@ -126,6 +126,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def get_job(project_id: str, job_id: str) -> dict:
         return projects.get_job(project_id, job_id)
 
+    @app.post("/api/projects/{project_id}/jobs/{job_id}/cancel", response_model=JobResponse, dependencies=[Depends(require_session)])
+    def cancel_job(project_id: str, job_id: str) -> dict:
+        try:
+            return projects.cancel_job(project_id, job_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/api/projects/{project_id}/checklist", response_model=list[ChecklistSlot], dependencies=[Depends(require_session)])
     def checklist(project_id: str, checklist_type_id: str | None = None) -> list[dict]:
         return projects.list_slots(project_id, checklist_type_id)
