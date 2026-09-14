@@ -195,22 +195,37 @@ class ProjectService:
             for label, _ in items:
                 db.execute("INSERT OR IGNORE INTO checklist_catalog(label, aliases_json) VALUES (?, '[]')", (label,))
 
-    def import_gallery(self, project_id: str, gallery: Path) -> None:
+    def import_gallery(self, project_id: str, gallery: Path) -> dict:
+        """Add only new image content from a source gallery to one project.
+
+        SHA-256 is the stable content identity. Matching content already has
+        local processing records, so it is not copied, vectorized, or OCR'd
+        again when the source gallery is updated.
+        """
         root = self.project_root(project_id)
         images = sorted(path for path in gallery.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
         if not images:
             raise ValueError("图库中没有可用图片")
+        added_count = 0
+        skipped_count = 0
         with connect(self.db_path(project_id)) as db:
             known_hashes = {row["sha256"]: row["id"] for row in db.execute("SELECT id, sha256 FROM photos")}
+            existing_hashes = set(known_hashes)
             known_dhashes = [(row["id"], row["dhash"]) for row in db.execute("SELECT id, dhash FROM photos")]
             for source in images:
                 inspection = inspect_image(source)
                 existing = known_hashes.get(inspection.sha256)
+                # Only skip content that was already part of this project
+                # before this update.  Two files with the same content in one
+                # newly imported batch remain visible as separate gallery
+                # photos and can share the first photo's vector as before.
+                if inspection.sha256 in existing_hashes:
+                    skipped_count += 1
+                    continue
                 photo_id = str(uuid.uuid4())
                 target_name = f"{photo_id}__{source.name}"
                 target = root / "originals" / target_name
                 shutil.copy2(source, target)
-                duplicate_of = existing
                 nearby = [known_id for known_id, known_hash in known_dhashes if hamming_distance(inspection.dhash, known_hash) <= 4]
                 near_group = nearby[0] if nearby else None
                 db.execute(
@@ -230,13 +245,19 @@ class ProjectService:
                         inspection.bright_ratio,
                         inspection.quality_score,
                         flags_json(inspection.flags),
-                        duplicate_of,
+                        existing,
                         near_group,
                         utcnow(),
                     ),
                 )
                 known_hashes[inspection.sha256] = photo_id
                 known_dhashes.append((photo_id, inspection.dhash))
+                added_count += 1
+        return {
+            "added_count": added_count,
+            "skipped_count": skipped_count,
+            "message": f"图库已更新：新增 {added_count} 张，已跳过 {skipped_count} 张已有图片。请为新增图片建立向量和本地 OCR。",
+        }
 
     def list_projects(self) -> list[dict]:
         projects = []
@@ -324,7 +345,43 @@ class ProjectService:
         thread.start()
         return self.get_job(project_id, job_id)
 
-    def _index_worker(self, project_id: str, job_id: str) -> None:
+    def start_gallery_processing(self, project_id: str) -> dict:
+        """Queue one non-blocking pipeline for new image vectors, OCR and matching."""
+        root = self.project_root(project_id)
+        self._copy_exact_duplicate_ocr(project_id)
+        with connect(self.db_path(project_id)) as db:
+            running = db.execute(
+                "SELECT * FROM jobs WHERE kind IN ('index', 'ocr', 'gallery_processing') AND status='running' ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if running:
+                worker = self._jobs.get(running["id"])
+                if worker is not None and worker.is_alive():
+                    return self._job_dict(running, project_id)
+                db.execute(
+                    "UPDATE jobs SET status='interrupted', message=?, updated_at=? WHERE id=?",
+                    ("上次图库处理因应用关闭或重启而中断；可重新处理剩余图片", utcnow(), running["id"]),
+                )
+            vector_rows = db.execute(
+                "SELECT p.* FROM photos p LEFT JOIN embeddings e ON e.photo_id=p.id WHERE e.photo_id IS NULL AND p.duplicate_of IS NULL"
+            ).fetchall()
+            ocr_rows = db.execute(
+                "SELECT p.* FROM photos p LEFT JOIN ocr_results o ON o.photo_id=p.id WHERE o.photo_id IS NULL AND p.duplicate_of IS NULL"
+            ).fetchall()
+            estimate = sum(estimated_visual_tokens(row["width"], row["height"]) for row in vector_rows)
+            if estimate > self.settings.token_budget:
+                raise ValueError(f"预计 {estimate} Token，超过当前项目 {self.settings.token_budget} Token 预算")
+            slot_count = int(db.execute("SELECT COUNT(*) FROM checklist_slots").fetchone()[0])
+            job_id = str(uuid.uuid4())
+            db.execute(
+                "INSERT INTO jobs VALUES (?, 'gallery_processing', 'queued', 0, ?, '等待处理新增图片', ?, 0, ?, ?)",
+                (job_id, len(vector_rows) + len(ocr_rows) + slot_count, estimate, utcnow(), utcnow()),
+            )
+        thread = threading.Thread(target=self._index_worker, args=(project_id, job_id, True), daemon=True)
+        self._jobs[job_id] = thread
+        thread.start()
+        return self.get_job(project_id, job_id)
+
+    def _index_worker(self, project_id: str, job_id: str, include_ocr: bool = False) -> None:
         root = self.project_root(project_id)
         with QwenEmbeddingClient(
             self.settings.dashscope_api_key,
@@ -370,6 +427,27 @@ class ProjectService:
                             (ordinal, result.input_tokens, f"已处理 {ordinal}/{len(rows)} 张图片", utcnow(), job_id),
                         )
                 self._copy_exact_duplicate_vectors(project_id)
+                processed_image_steps = len(rows)
+                if include_ocr:
+                    with connect(self.db_path(project_id)) as db:
+                        db.execute("UPDATE jobs SET message='正在建立新增图片的本地文字索引', updated_at=? WHERE id=?", (utcnow(), job_id))
+                        ocr_rows = db.execute(
+                            "SELECT p.* FROM photos p LEFT JOIN ocr_results o ON o.photo_id=p.id WHERE o.photo_id IS NULL AND p.duplicate_of IS NULL ORDER BY p.created_at"
+                        ).fetchall()
+                    ocr_client = LocalOcrClient()
+                    for ordinal, row in enumerate(ocr_rows, start=1):
+                        original = self.safe_photo_path(project_id, row["id"])
+                        derivative = root / "derived" / "ocr" / f"{row['id']}__{row['source_filename']}.jpg"
+                        make_derivative(original, derivative, 1600, 90)
+                        text = ocr_client.extract_text(derivative)
+                        with connect(self.db_path(project_id)) as db:
+                            db.execute("INSERT OR REPLACE INTO ocr_results VALUES (?, ?, ?)", (row["id"], text, utcnow()))
+                            db.execute(
+                                "UPDATE jobs SET current=?, message=?, updated_at=? WHERE id=?",
+                                (len(rows) + ordinal, f"本地 OCR 已识别 {ordinal}/{len(ocr_rows)} 张新增图片", utcnow(), job_id),
+                            )
+                    self._copy_exact_duplicate_ocr(project_id)
+                    processed_image_steps += len(ocr_rows)
                 with connect(self.db_path(project_id)) as db:
                     db.execute("UPDATE jobs SET message='开始按清单匹配候选照片', updated_at=? WHERE id=?", (utcnow(), job_id))
                     slots = db.execute("SELECT id, label, item_key, checklist_type_id FROM checklist_slots ORDER BY ordinal").fetchall()
@@ -385,8 +463,8 @@ class ProjectService:
                         db.execute(
                             "UPDATE jobs SET current=?, total=?, message=?, updated_at=? WHERE id=?",
                             (
-                                len(rows) + ordinal,
-                                len(rows) + len(slots),
+                                processed_image_steps + ordinal,
+                                processed_image_steps + len(slots),
                                 f"正在匹配清单 {ordinal}/{len(slots)}：{slot['label']}",
                                 utcnow(),
                                 job_id,
@@ -397,7 +475,8 @@ class ProjectService:
                     self._deduplicate_system_confirmations(project_id, checklist_type_id)
                     self.confirm_all_top_candidates(project_id, checklist_type_id)
                 with connect(self.db_path(project_id)) as db:
-                    db.execute("UPDATE jobs SET status='completed', message='图片向量化与清单匹配已全部完成', updated_at=? WHERE id=?", (utcnow(), job_id))
+                    completion_message = '新增图片的向量、OCR 与清单匹配已全部完成' if include_ocr else '图片向量化与清单匹配已全部完成'
+                    db.execute("UPDATE jobs SET status='completed', message=?, updated_at=? WHERE id=?", (completion_message, utcnow(), job_id))
                     db.execute("UPDATE project SET status='indexed'")
             except Exception as exc:
                 with connect(self.db_path(project_id)) as db:
@@ -414,15 +493,37 @@ class ProjectService:
                         (row["id"], source["model"], source["dimension"], source["preprocess_version"], source["vector"], 0, utcnow()),
                     )
 
+    def _copy_exact_duplicate_ocr(self, project_id: str) -> None:
+        """Reuse local OCR text for byte-identical gallery photos."""
+        with connect(self.db_path(project_id)) as db:
+            duplicates = db.execute("SELECT id, duplicate_of FROM photos WHERE duplicate_of IS NOT NULL").fetchall()
+            for row in duplicates:
+                source = db.execute("SELECT text FROM ocr_results WHERE photo_id=?", (row["duplicate_of"],)).fetchone()
+                if source:
+                    db.execute(
+                        "INSERT OR REPLACE INTO ocr_results VALUES (?, ?, ?)",
+                        (row["id"], source["text"], utcnow()),
+                    )
+
     def start_ocr(self, project_id: str) -> dict:
         """Build a local text index only after the user explicitly requests it."""
         root = self.project_root(project_id)
+        self._copy_exact_duplicate_ocr(project_id)
         with connect(self.db_path(project_id)) as db:
             running = db.execute("SELECT * FROM jobs WHERE kind='ocr' AND status='running' ORDER BY created_at DESC LIMIT 1").fetchone()
             if running:
-                return self._job_dict(running, project_id)
+                worker = self._jobs.get(running["id"])
+                if worker is not None and worker.is_alive():
+                    return self._job_dict(running, project_id)
+                # Worker threads are process-local.  After an app restart an old
+                # daemon thread cannot resume, so leaving this row as "running"
+                # would permanently prevent the remaining photos from being read.
+                db.execute(
+                    "UPDATE jobs SET status='interrupted', message=?, updated_at=? WHERE id=?",
+                    ("上次本地 OCR 因应用关闭或重启而中断；已保留已识别图片，可继续处理剩余图片", utcnow(), running["id"]),
+                )
             photos = db.execute(
-                "SELECT p.* FROM photos p LEFT JOIN ocr_results o ON o.photo_id=p.id WHERE o.photo_id IS NULL"
+                "SELECT p.* FROM photos p LEFT JOIN ocr_results o ON o.photo_id=p.id WHERE o.photo_id IS NULL AND p.duplicate_of IS NULL"
             ).fetchall()
             job_id = str(uuid.uuid4())
             db.execute(
@@ -484,7 +585,7 @@ class ProjectService:
             with connect(self.db_path(project_id)) as db:
                 db.execute("UPDATE jobs SET status='running', message='正在用本地 OCR 建立文字索引', updated_at=? WHERE id=?", (utcnow(), job_id))
                 rows = db.execute(
-                    "SELECT p.* FROM photos p LEFT JOIN ocr_results o ON o.photo_id=p.id WHERE o.photo_id IS NULL ORDER BY p.created_at"
+                    "SELECT p.* FROM photos p LEFT JOIN ocr_results o ON o.photo_id=p.id WHERE o.photo_id IS NULL AND p.duplicate_of IS NULL ORDER BY p.created_at"
                 ).fetchall()
             for ordinal, row in enumerate(rows, start=1):
                 original = self.safe_photo_path(project_id, row["id"])
@@ -497,6 +598,7 @@ class ProjectService:
                         "UPDATE jobs SET current=?, message=?, updated_at=? WHERE id=?",
                         (ordinal, f"本地 OCR 已识别 {ordinal}/{len(rows)} 张图片", utcnow(), job_id),
                     )
+            self._copy_exact_duplicate_ocr(project_id)
             with connect(self.db_path(project_id)) as db:
                 db.execute("UPDATE jobs SET status='completed', message='本地文字索引已完成，可重新匹配清单', updated_at=? WHERE id=?", (utcnow(), job_id))
         except Exception as exc:

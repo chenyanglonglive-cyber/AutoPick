@@ -2,6 +2,20 @@
 
 本文件面向接手此仓库的 AI Agent。按以下约定配置、运行和修改项目，避免将客户业务数据写入代码仓库，或破坏固定 Excel 清单的版式。
 
+## 0. 获取代码与首次启动
+
+- GitHub 仓库（公开拉取地址）：<https://github.com/chenyanglonglive-cyber/AutoPick>
+- 克隆并进入项目：
+
+```powershell
+git clone https://github.com/chenyanglonglive-cyber/AutoPick.git
+Set-Location AutoPick
+```
+
+- 如需使用当前已发布的稳定版本，可执行 `git checkout V1.0.0`；否则直接使用默认分支的最新代码。
+- 将 `.env.example` 复制为 `.env`，填写真实的 `DASHSCOPE_API_KEY`；`.env` 只保留在本机，绝不提交。
+- 依次安装 Python 与前端依赖，并按第 3 节启动。完整的可交接运行说明与发布检查表位于 `docs/agent-handoff/`。
+
 ## 1. 项目定位与当前主流程
 
 - AutoPick 是本地运行的工厂审核清单选图工具。

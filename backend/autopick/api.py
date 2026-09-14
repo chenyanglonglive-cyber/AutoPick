@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from backend.autopick.config import Settings, load_settings
 from backend.autopick.schemas import (
     CandidateResponse,
+    GalleryImportRequest,
     GalleryPhotoResponse,
     ChecklistSlot,
     ConfirmRequest,
@@ -107,6 +108,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/api/projects/{project_id}/gallery/process", response_model=JobResponse, dependencies=[Depends(require_session)])
+    def process_gallery(project_id: str) -> dict:
+        try:
+            return projects.start_gallery_processing(project_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/projects/{project_id}/match", response_model=JobResponse, dependencies=[Depends(require_session)])
     def match_project(project_id: str, checklist_type_id: str | None = None) -> dict:
         try:
@@ -133,6 +141,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/projects/{project_id}/ocr", response_model=JobResponse, dependencies=[Depends(require_session)])
     def ocr_project(project_id: str) -> dict:
         return projects.start_ocr(project_id)
+
+    @app.post("/api/projects/{project_id}/gallery/import", dependencies=[Depends(require_session)])
+    def import_gallery(project_id: str, payload: GalleryImportRequest) -> dict:
+        gallery = Path(payload.gallery_path).expanduser().resolve()
+        if not gallery.is_dir():
+            raise HTTPException(status_code=400, detail="图库路径不是有效文件夹")
+        return projects.import_gallery(project_id, gallery)
 
     @app.get("/api/projects/{project_id}/slots/{slot_id}/candidates", response_model=list[CandidateResponse], dependencies=[Depends(require_session)])
     def candidates(project_id: str, slot_id: str) -> list[dict]:

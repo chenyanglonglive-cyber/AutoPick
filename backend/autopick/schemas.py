@@ -12,6 +12,10 @@ class ProjectCreate(BaseModel):
     checklist_type_id: str = "quality_v1"
 
 
+class GalleryImportRequest(BaseModel):
+    gallery_path: str = Field(min_length=1, max_length=1000)
+
+
 class ProjectDeleteRequest(BaseModel):
     factory_name: str = Field(min_length=2, max_length=160)
 
