@@ -151,10 +151,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/projects/{project_id}/gallery/import", dependencies=[Depends(require_session)])
     def import_gallery(project_id: str, payload: GalleryImportRequest) -> dict:
-        gallery = Path(payload.gallery_path).expanduser().resolve()
-        if not gallery.is_dir():
-            raise HTTPException(status_code=400, detail="图库路径不是有效文件夹")
-        return projects.import_gallery(project_id, gallery)
+        if payload.file_paths:
+            paths = [Path(p) for p in payload.file_paths]
+            try:
+                return projects.import_photos(project_id, paths)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if payload.gallery_path:
+            gallery = Path(payload.gallery_path).expanduser().resolve()
+            if not gallery.is_dir():
+                raise HTTPException(status_code=400, detail="图库路径不是有效文件夹")
+            try:
+                return projects.import_gallery(project_id, gallery)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="请提供图库文件夹路径或图片文件列表")
 
     @app.get("/api/projects/{project_id}/slots/{slot_id}/candidates", response_model=list[CandidateResponse], dependencies=[Depends(require_session)])
     def candidates(project_id: str, slot_id: str) -> list[dict]:
@@ -189,6 +200,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def reject(project_id: str, slot_id: str, payload: RejectRequest) -> dict:
         projects.reject(project_id, slot_id, payload.photo_id, payload.reason)
         return {"status": "rejected"}
+
+    @app.post("/api/projects/{project_id}/slots/{slot_id}/skip", dependencies=[Depends(require_session)])
+    def skip_slot(project_id: str, slot_id: str) -> dict:
+        try:
+            projects.skip_slot(project_id, slot_id)
+            return {"status": "skipped"}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/projects/{project_id}/slots/{slot_id}/unskip", dependencies=[Depends(require_session)])
+    def unskip_slot(project_id: str, slot_id: str) -> dict:
+        try:
+            projects.unskip_slot(project_id, slot_id)
+            return {"status": "unskipped"}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/projects/{project_id}/export/preflight", dependencies=[Depends(require_session)])
     def export_preflight(project_id: str, checklist_type_id: str | None = None) -> dict:
@@ -225,11 +252,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/projects/{project_id}/photos/{photo_id}/file")
-    def photo_file(project_id: str, photo_id: str, token: str):
+    def photo_file(project_id: str, photo_id: str, token: str, thumbnail: bool = False):
         if token != settings.session_token:
             raise HTTPException(status_code=401, detail="Invalid local session token")
         try:
-            path = projects.safe_photo_path(project_id, photo_id)
+            if thumbnail:
+                path = projects.safe_thumbnail_path(project_id, photo_id)
+            else:
+                path = projects.safe_photo_path(project_id, photo_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return FileResponse(path)

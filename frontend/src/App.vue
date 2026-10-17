@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api, initSession, type Candidate, type ChecklistType, type GalleryPhoto, type Project, type Slot, type Preflight } from './api'
 
 const projects = ref<Project[]>([])
@@ -25,16 +25,100 @@ const job = ref<any>(null)
 const appVersion = ref('')
 const form = ref({ factory_name: '', gallery_path: '', checklist_type_id: 'quality_v1' })
 
-type DesktopApi = { select_folder: () => Promise<string | null>; select_feedback_file?: () => Promise<string | null>; open_data_folder?: (projectId: string) => Promise<boolean> }
+type DesktopApi = { select_folder: () => Promise<string | null>; select_photos?: () => Promise<string[] | null>; select_feedback_file?: () => Promise<string | null>; open_data_folder?: (projectId: string) => Promise<boolean> }
 function desktopApi(): DesktopApi | null { return (window as any).pywebview?.api || null }
 async function chooseFolder() { const selected = await desktopApi()?.select_folder(); if (selected) form.value.gallery_path = selected }
 async function openDataFolder() { if (activeProject.value && desktopApi()?.open_data_folder) await desktopApi()!.open_data_folder!(activeProject.value.id) }
-function imageUrl(photoId: string) { return activeProject.value ? api.imageUrl(activeProject.value.id, photoId) : '' }
+function imageUrl(photoId: string, thumbnail: boolean = true) { return activeProject.value ? api.imageUrl(activeProject.value.id, photoId, thumbnail) : '' }
 function confidenceClass(slot: Slot) { if (slot.top_score == null) return 'none'; if (slot.top_score >= .35) return 'high'; if (slot.top_score >= .22) return 'medium'; return 'low' }
 function usedElsewhere(photo: Candidate) { return photo.used_in_slots.filter(slotId => slotId !== activeSlot.value?.id).length }
 function isAutoEligible(photo: Candidate) { return photo.score >= .35 && photo.semantic_score >= .18 }
 const displayedCandidates = computed(() => searchResults.value.length ? searchResults.value : candidates.value)
 const displayedGallery = computed(() => galleryResults.value.length ? galleryResults.value : galleryPhotos.value)
+
+const showDrawer = ref(false)
+const drawerSearch = ref('')
+const drawerOnlyUnused = ref(false)
+
+const usedPhotoIds = computed(() => {
+  const set = new Set<string>()
+  for (const s of slots.value) {
+    for (const pid of s.confirmed_photo_ids) {
+      set.add(pid)
+    }
+  }
+  return set
+})
+
+const filteredDrawerPhotos = computed(() => {
+  let list = galleryPhotos.value
+  if (drawerOnlyUnused.value) {
+    list = list.filter(p => !usedPhotoIds.value.has(p.photo_id))
+  }
+  const q = drawerSearch.value.trim().toLowerCase()
+  if (q) {
+    list = list.filter(p => {
+      const fn = p.filename.toLowerCase()
+      const ocr = (p.ocr_text_preview || '').toLowerCase()
+      return fn.includes(q) || ocr.includes(q)
+    })
+  }
+  return list
+})
+
+async function openDrawer() {
+  if (!activeProject.value) return
+  if (!galleryPhotos.value.length) {
+    loading.value = true
+    try {
+      galleryPhotos.value = await api.gallery(activeProject.value.id)
+    } finally {
+      loading.value = false
+    }
+  }
+  drawerSearch.value = ''
+  showDrawer.value = true
+}
+
+function closeDrawer() {
+  showDrawer.value = false
+}
+
+async function selectPhotoFromDrawer(photo: GalleryPhoto) {
+  if (!activeProject.value || !activeSlot.value) return
+  await usePhoto(photo)
+  showDrawer.value = false
+}
+
+const currentPreviewList = computed<(Candidate | GalleryPhoto)[]>(() => {
+  if (showDrawer.value) return filteredDrawerPhotos.value
+  return activeView.value === 'gallery' ? displayedGallery.value : displayedCandidates.value
+})
+const previewIndex = computed(() => {
+  if (!previewImage.value) return -1
+  return currentPreviewList.value.findIndex(p => p.photo_id === previewImage.value?.photo_id)
+})
+function prevPreview() {
+  if (previewIndex.value > 0) {
+    previewImage.value = currentPreviewList.value[previewIndex.value - 1]
+  }
+}
+function nextPreview() {
+  if (previewIndex.value >= 0 && previewIndex.value < currentPreviewList.value.length - 1) {
+    previewImage.value = currentPreviewList.value[previewIndex.value + 1]
+  }
+}
+function handleKeydown(e: KeyboardEvent) {
+  if (previewImage.value) {
+    if (e.key === 'ArrowLeft') prevPreview()
+    else if (e.key === 'ArrowRight') nextPreview()
+    else if (e.key === 'Escape') previewImage.value = null
+    return
+  }
+  if (showDrawer.value && e.key === 'Escape') {
+    closeDrawer()
+  }
+}
 const progress = computed(() => job.value?.total ? Math.round(job.value.current / job.value.total * 100) : 0)
 const galleryProcessing = computed(() => job.value?.kind === 'gallery_processing' && ['queued', 'running', 'cancelling'].includes(job.value.status))
 const activeIndex = computed(() => activeSlot.value ? slots.value.findIndex(slot => slot.id === activeSlot.value?.id) : -1)
@@ -51,19 +135,104 @@ async function createProject() { loading.value = true; error.value = ''; try { c
 async function startIndex() { if (!activeProject.value) return; loading.value = true; error.value = ''; try { job.value = await api.index(activeProject.value.id); while (['queued', 'running'].includes(job.value.status)) { await new Promise(resolve => setTimeout(resolve, 800)); job.value = await api.job(activeProject.value.id, job.value.id) } if (job.value.status !== 'completed') throw new Error(job.value.message); await openProject(activeProject.value); message.value = '图片向量化和清单匹配已完成。' } catch (e: any) { error.value = e.message } finally { loading.value = false } }
 async function startMatch() { if (!activeProject.value) return; loading.value = true; error.value = ''; try { job.value = await api.match(activeProject.value.id, activeChecklistTypeId.value); while (['queued', 'running'].includes(job.value.status)) { await new Promise(resolve => setTimeout(resolve, 800)); job.value = await api.job(activeProject.value.id, job.value.id) } if (job.value.status !== 'completed') throw new Error(job.value.message); await loadChecklist(); message.value = job.value.message } catch (e: any) { error.value = e.message } finally { loading.value = false } }
 async function search() { if (!activeProject.value || !searchText.value.trim()) return; loading.value = true; try { searchResults.value = await api.search(activeProject.value.id, searchText.value.trim(), activeChecklistTypeId.value) } catch (e: any) { error.value = e.message } finally { loading.value = false } }
-async function usePhoto(photo: Candidate | GalleryPhoto) { if (!activeProject.value || !activeSlot.value) return; try { await api.confirm(activeProject.value.id, activeSlot.value.id, photo.photo_id, searchText.value); activeSlot.value.confirmed_photo_ids = [photo.photo_id]; slots.value = slots.value.map(slot => slot.id === activeSlot.value?.id ? activeSlot.value! : slot); preflight.value = await api.preflight(activeProject.value.id, activeChecklistTypeId.value); message.value = '已确认：' + photo.filename } catch (e: any) { error.value = e.message } }
+async function usePhoto(photo: Candidate | GalleryPhoto) {
+  if (!activeProject.value || !activeSlot.value) return;
+  try {
+    await api.confirm(activeProject.value.id, activeSlot.value.id, photo.photo_id, searchText.value);
+    activeSlot.value.confirmed_photo_ids = [photo.photo_id];
+    activeSlot.value.is_skipped = false;
+    slots.value = slots.value.map(slot => slot.id === activeSlot.value?.id ? { ...activeSlot.value! } : slot);
+    preflight.value = await api.preflight(activeProject.value.id, activeChecklistTypeId.value);
+    message.value = '已确认：' + photo.filename;
+  } catch (e: any) {
+    error.value = e.message;
+  }
+}
+
+async function skipCurrentSlot() {
+  if (!activeProject.value || !activeSlot.value) return;
+  const currentSlotLabel = activeSlot.value.label;
+  try {
+    await api.skipSlot(activeProject.value.id, activeSlot.value.id);
+    activeSlot.value.confirmed_photo_ids = [];
+    activeSlot.value.is_skipped = true;
+    slots.value = slots.value.map(slot => slot.id === activeSlot.value?.id ? { ...activeSlot.value! } : slot);
+    preflight.value = await api.preflight(activeProject.value.id, activeChecklistTypeId.value);
+    message.value = `已跳过「${currentSlotLabel}」，导出清单时将保持留空。`;
+    if (activeIndex.value < slots.value.length - 1) {
+      await selectSlot(slots.value[activeIndex.value + 1]);
+    }
+  } catch (e: any) {
+    error.value = e.message;
+  }
+}
+
+async function unskipCurrentSlot() {
+  if (!activeProject.value || !activeSlot.value) return;
+  try {
+    await api.unskipSlot(activeProject.value.id, activeSlot.value.id);
+    activeSlot.value.is_skipped = false;
+    slots.value = slots.value.map(slot => slot.id === activeSlot.value?.id ? { ...activeSlot.value! } : slot);
+    preflight.value = await api.preflight(activeProject.value.id, activeChecklistTypeId.value);
+    message.value = `已取消跳过「${activeSlot.value.label}」。`;
+  } catch (e: any) {
+    error.value = e.message;
+  }
+}
 async function confirmAll() { if (!activeProject.value) return; try { const result = await api.confirmAllTop(activeProject.value.id, activeChecklistTypeId.value); await loadChecklist(); message.value = result.message } catch (e: any) { error.value = e.message } }
 async function exportExcel() { if (!activeProject.value) return; loading.value = true; try { const result = await api.exportExcel(activeProject.value.id, activeChecklistTypeId.value); preflight.value = result; if (result.download_url) window.open(result.download_url, '_blank'); message.value = '已导出 Excel；' + (result.missing_count || 0) + ' 项缺图已留空。' } catch (e: any) { error.value = e.message } finally { loading.value = false } }
 async function clearGallery() { if (!activeProject.value) return; const name = window.prompt('请输入“' + activeProject.value.factory_name + '”确认清空当前项目图库'); if (name !== activeProject.value.factory_name) return; try { const result = await api.clearGallery(activeProject.value.id, name); await openProject(activeProject.value); message.value = result.message } catch (e: any) { error.value = e.message } }
 async function deleteProject() { if (!activeProject.value) return; const project = activeProject.value; const name = window.prompt('删除会移除“' + project.factory_name + '”的项目数据和已导出清单。请输入项目名称确认删除'); if (name !== project.factory_name) return; loading.value = true; try { const result = await api.deleteProject(project.id, name); projects.value = await api.projects(); activeProject.value = null; slots.value = []; activeSlot.value = null; candidates.value = []; galleryPhotos.value = []; preflight.value = null; if (projects.value.length) await openProject(projects.value[0]); message.value = result.message } catch (e: any) { error.value = e.message } finally { loading.value = false } }
 async function importFeedback() { if (!activeProject.value || !desktopApi()?.select_feedback_file) return; const path = await desktopApi()!.select_feedback_file!(); if (!path) return; loading.value = true; try { const result = await api.importFeedback(activeProject.value.id, path); await openProject(activeProject.value); message.value = result.message } catch (e: any) { error.value = e.message } finally { loading.value = false } }
 async function openGallery() { if (!activeProject.value) return; activeView.value = 'gallery'; galleryPhotos.value = await api.gallery(activeProject.value.id); galleryResults.value = [] }
-async function updateGallery() { if (!activeProject.value) return; const selected = await desktopApi()?.select_folder() || window.prompt('请选择或输入更新后的图库文件夹路径'); if (!selected) return; loading.value = true; try { const result = await api.importGallery(activeProject.value.id, selected); await openGallery(); message.value = result.message } catch (e: any) { error.value = e.message } finally { loading.value = false } }
+async function updateGallery() {
+  if (!activeProject.value) return;
+  const desktop = desktopApi();
+  let filePaths: string[] | null = null;
+  let folderPath: string | null = null;
+
+  if (desktop?.select_photos) {
+    filePaths = await desktop.select_photos();
+    if (!filePaths || !filePaths.length) return;
+  } else if (desktop?.select_folder) {
+    folderPath = await desktop.select_folder();
+    if (!folderPath) return;
+  } else {
+    folderPath = window.prompt('请选择或输入更新后的图库文件夹路径');
+    if (!folderPath) return;
+  }
+
+  loading.value = true;
+  try {
+    const result = filePaths
+      ? await api.importGallery(activeProject.value.id, { file_paths: filePaths })
+      : await api.importGallery(activeProject.value.id, { gallery_path: folderPath! });
+    await openGallery();
+    message.value = result.message;
+  } catch (e: any) {
+    error.value = e.message;
+  } finally {
+    loading.value = false;
+  }
+}
 async function followGalleryProcessing(projectId: string, jobId: string) { try { while (job.value && ['queued', 'running', 'cancelling'].includes(job.value.status)) { await new Promise(resolve => setTimeout(resolve, 800)); job.value = await api.job(projectId, jobId) }; if (job.value?.status === 'cancelled') { if (activeProject.value?.id === projectId && activeView.value === 'gallery') await openGallery(); message.value = job.value.message; return }; if (!job.value || job.value.status !== 'completed') throw new Error(job.value?.message || '图库处理未完成，请重试。'); if (activeProject.value?.id === projectId) { await openProject(activeProject.value); if (activeView.value === 'gallery') await openGallery() }; message.value = job.value.message } catch (e: any) { error.value = e.message } }
 async function processGallery() { if (!activeProject.value) return; try { const projectId = activeProject.value.id; if (galleryProcessing.value && job.value) { job.value = await api.cancelJob(projectId, job.value.id); message.value = '正在停止处理；当前图片完成后会保留已有结果。'; return }; job.value = await api.processGallery(projectId); message.value = '已在后台开始图片向量化和 OCR；首次处理全部图片，之后只处理新增内容。'; void followGalleryProcessing(projectId, job.value.id) } catch (e: any) { error.value = e.message } }
 async function searchGallery() { if (!activeProject.value || !galleryQuery.value.trim()) return; galleryResults.value = await api.gallerySearch(activeProject.value.id, galleryQuery.value.trim()) }
 async function startOcr() { if (!activeProject.value) return; loading.value = true; try { job.value = await api.ocr(activeProject.value.id); while (['queued', 'running'].includes(job.value.status)) { await new Promise(resolve => setTimeout(resolve, 800)); job.value = await api.job(activeProject.value.id, job.value.id) }; if (job.value.status !== 'completed') throw new Error(job.value.message || '本地 OCR 未完成，请重试。'); galleryPhotos.value = await api.gallery(activeProject.value.id); message.value = '本地文字索引已完成；点击“重新匹配清单”即可将 OCR 结果加入排序。' } catch (e: any) { error.value = e.message } finally { loading.value = false } }
-onMounted(async () => { try { const session = await initSession(); appVersion.value = session.version || ''; checklistTypes.value = await api.checklistTypes(); await refreshProjects() } catch (e: any) { error.value = e.message } })
+onMounted(async () => {
+  window.addEventListener('keydown', handleKeydown)
+  try {
+    const session = await initSession()
+    appVersion.value = session.version || ''
+    checklistTypes.value = await api.checklistTypes()
+    await refreshProjects()
+  } catch (e: any) {
+    error.value = e.message
+  }
+})
+onUnmounted(() => {
+  window.removeEventListener('keydown', handleKeydown)
+})
 </script>
 
 <template>
@@ -87,15 +256,59 @@ onMounted(async () => { try { const session = await initSession(); appVersion.va
       <aside v-if="activeView === 'checklist'" class="slots-panel">
         <div class="slots-header"><div class="checklist-selector-wrap"><label for="active-checklist">当前清单</label><select id="active-checklist" v-model="activeChecklistTypeId" @change="switchChecklist"><option v-for="type in checklistTypes" :key="type.id" :value="type.id">{{ type.label }} ({{ type.slot_count }} items)</option></select></div><span class="slots-stats">{{ preflight?.selected_slots || 0 }}/{{ slots.length }} 已确认</span></div>
         <div class="slots-bulk-action"><div class="checklist-actions"><button class="btn-select-all" :disabled="loading" @click="startMatch">重新匹配并自动选最佳</button><button class="btn-rematch" :disabled="loading" @click="confirmAll">仅自动选最佳</button></div><small>重新匹配会使用已有向量计算候选；两种操作都不覆盖人工确认或拒绝项。</small></div>
-        <div class="slots-scroll"><button v-for="slot in slots" :key="slot.id" :class="[{ active: slot.id === activeSlot?.id }, 'confidence-line-' + confidenceClass(slot)]" @click="selectSlot(slot)"><span class="slot-btn-content"><span class="slot-index">{{ slot.ordinal }}</span><span class="slot-label">{{ slot.label }}</span></span></button></div>
+        <div class="slots-scroll"><button v-for="slot in slots" :key="slot.id" :class="[{ active: slot.id === activeSlot?.id }, 'confidence-line-' + confidenceClass(slot)]" @click="selectSlot(slot)"><span class="slot-btn-content"><span class="slot-index">{{ slot.ordinal }}</span><span class="slot-label">{{ slot.label }}</span><span v-if="slot.is_skipped" class="slot-skip-tag">留空</span></span></button></div>
       </aside>
 
       <section v-if="activeView === 'checklist'" class="content-panel">
-        <div class="slot-heading"><div><p class="eyebrow">{{ activeChecklistLabel }} · 第 {{ activeIndex + 1 }}/{{ slots.length }} 项</p><h1>{{ activeSlot?.label || '审核清单' }}</h1></div><div class="slot-nav-actions"><button class="secondary nav-btn" :disabled="activeIndex <= 0" @click="selectSlot(slots[activeIndex - 1])">◀ 上一项</button><button class="secondary nav-btn" :disabled="activeIndex >= slots.length - 1" @click="selectSlot(slots[activeIndex + 1])">下一项 ▶</button></div></div>
+        <div class="slot-heading">
+          <div>
+            <p class="eyebrow">{{ activeChecklistLabel }} · 第 {{ activeIndex + 1 }}/{{ slots.length }} 项</p>
+            <div class="slot-title-row">
+              <h1>{{ activeSlot?.label || '审核清单' }}</h1>
+              <button
+                v-if="activeSlot && !activeSlot.is_skipped"
+                type="button"
+                class="btn-skip-slot"
+                @click="skipCurrentSlot"
+                title="跳过此项：不填入图片，导出清单时保持留空"
+              >
+                ⏭️ 跳过此项（留空）
+              </button>
+              <div v-else-if="activeSlot && activeSlot.is_skipped" class="slot-skipped-badge-group">
+                <span class="badge-skipped">⏭️ 已标记跳过（输出时留空）</span>
+                <button
+                  type="button"
+                  class="btn-unskip-slot"
+                  @click="unskipCurrentSlot"
+                  title="恢复为此项选图"
+                >
+                  撤销跳过
+                </button>
+              </div>
+            </div>
+          </div>
+          <div class="slot-nav-actions">
+            <button class="secondary nav-btn" :disabled="activeIndex <= 0" @click="selectSlot(slots[activeIndex - 1])">◀ 上一项</button>
+            <button class="secondary nav-btn" :disabled="activeIndex >= slots.length - 1" @click="selectSlot(slots[activeIndex + 1])">下一项 ▶</button>
+          </div>
+        </div>
         <div class="search-bar"><input v-model="searchText" @keyup.enter="search" placeholder="自然语言搜图，例如：车间入口的消火栓、特种设备检验合格证..." /><button @click="search">在当前图库搜索</button><button v-if="searchResults.length" class="secondary" @click="searchResults = []; searchText = ''">返回推荐</button></div>
         <div class="section-title-bar"><h3>{{ searchResults.length ? '搜索结果（' + searchResults.length + '）' : '候选照片匹配结果（按匹配度排序）' }}</h3><small class="tip">首张为系统首选，点击图片可放大查看。</small></div>
-        <div v-if="!displayedCandidates.length" class="no-photos">暂无候选照片。请先建立图片向量。</div>
-        <div v-else class="photo-grid"><article v-for="(photo, index) in displayedCandidates" :key="photo.photo_id" :class="['photo-card', { 'card-confirmed': activeSlot?.confirmed_photo_ids.includes(photo.photo_id), 'card-primary': index === 0 && !activeSlot?.confirmed_photo_ids.length && isAutoEligible(photo) }]"><div :class="['card-badge', activeSlot?.confirmed_photo_ids.includes(photo.photo_id) ? 'badge-confirmed' : index === 0 && isAutoEligible(photo) ? 'badge-primary' : 'badge-backup']">{{ activeSlot?.confirmed_photo_ids.includes(photo.photo_id) ? '★ 当前已选用' : index === 0 && isAutoEligible(photo) ? '推荐首选' : '备选 ' + (index + 1) }}</div><div class="img-wrapper" @click="previewImage = photo"><img :src="imageUrl(photo.photo_id)" :alt="photo.filename" loading="lazy" /><div class="img-overlay">🔍 点击放大</div></div><div class="photo-meta"><strong :title="photo.filename">{{ photo.filename }}</strong><div class="meta-row"><span>相似度 {{ photo.semantic_score.toFixed(3) }}</span><span>清晰度 {{ Math.round(photo.quality_score * 100) }}</span></div><small v-if="usedElsewhere(photo)">⚠️ 已用于其他 {{ usedElsewhere(photo) }} 个清单项</small><button v-if="activeSlot?.confirmed_photo_ids.includes(photo.photo_id)" class="btn-confirmed" disabled>✓ 当前已选定</button><button v-else class="btn-use" @click="usePhoto(photo)">选用此照片</button></div></article></div>
+        <div v-if="!displayedCandidates.length" class="no-photos">
+          <p>暂无候选照片推荐。您可以先建立图片向量，或直接打开全图库人工挑选。</p>
+          <button class="secondary" @click="openDrawer">从全图库挑选照片</button>
+        </div>
+        <div v-else class="photo-grid">
+          <article v-for="(photo, index) in displayedCandidates" :key="photo.photo_id" :class="['photo-card', { 'card-confirmed': activeSlot?.confirmed_photo_ids.includes(photo.photo_id), 'card-primary': index === 0 && !activeSlot?.confirmed_photo_ids.length && isAutoEligible(photo) }]"><div :class="['card-badge', activeSlot?.confirmed_photo_ids.includes(photo.photo_id) ? 'badge-confirmed' : index === 0 && isAutoEligible(photo) ? 'badge-primary' : 'badge-backup']">{{ activeSlot?.confirmed_photo_ids.includes(photo.photo_id) ? '★ 当前已选用' : index === 0 && isAutoEligible(photo) ? '推荐首选' : '备选 ' + (index + 1) }}</div><div class="img-wrapper" @click="previewImage = photo"><img :src="imageUrl(photo.photo_id)" :alt="photo.filename" loading="lazy" /><div class="img-overlay">🔍 点击放大</div></div><div class="photo-meta"><strong :title="photo.filename">{{ photo.filename }}</strong><div class="meta-row"><span>相似度 {{ photo.semantic_score.toFixed(3) }}</span><span>清晰度 {{ Math.round(photo.quality_score * 100) }}</span></div><small v-if="usedElsewhere(photo)">⚠️ 已用于其他 {{ usedElsewhere(photo) }} 个清单项</small><button v-if="activeSlot?.confirmed_photo_ids.includes(photo.photo_id)" class="btn-confirmed" disabled>✓ 当前已选定</button><button v-else class="btn-use" @click="usePhoto(photo)">选用此照片</button></div></article>
+          <div class="photo-card drawer-trigger-card" @click="openDrawer">
+            <div class="drawer-trigger-inner">
+              <div class="trigger-icon">📂</div>
+              <strong class="trigger-title">查看所有照片</strong>
+              <p class="trigger-desc">备选结果中没有合适的？点击打开抽屉，从全部 {{ galleryPhotos.length || activeProject?.photo_count || 0 }} 张图库照片中人工挑选</p>
+              <button type="button" class="btn-trigger-action">从图库挑选 ➜</button>
+            </div>
+          </div>
+        </div>
       </section>
 
       <section v-else class="content-panel">
@@ -121,7 +334,158 @@ onMounted(async () => { try { const session = await initSession(); appVersion.va
     </section>
 
     <section v-else class="empty-state"><h1>开始一个工厂项目</h1><p>选择图库后，系统会复制照片到项目目录并使用固定 Excel 清单匹配。</p><button class="primary-lg" @click="showCreate = true">新建工厂项目</button></section>
-    <div v-if="previewImage" class="lightbox-wrap" @click="previewImage = null"><div class="lightbox-content" @click.stop><div class="lightbox-header"><strong>{{ previewImage.filename }}</strong><button class="icon-close" @click="previewImage = null">✕</button></div><div class="lightbox-body"><img :src="imageUrl(previewImage.photo_id)" :alt="previewImage.filename" /></div><button class="btn-use" @click="usePhoto(previewImage); previewImage = null">选用这张照片</button></div></div>
+    <div v-if="previewImage" class="lightbox-wrap" @click="previewImage = null">
+      <button
+        v-if="currentPreviewList.length > 1"
+        class="lightbox-nav-btn prev"
+        :disabled="previewIndex <= 0"
+        @click.stop="prevPreview"
+        title="上一张 (← 键)"
+      >
+        ❮
+      </button>
+
+      <div class="lightbox-content" @click.stop>
+        <div class="lightbox-header">
+          <div class="lightbox-title-wrap">
+            <strong class="lightbox-filename" :title="previewImage.filename">{{ previewImage.filename }}</strong>
+            <span v-if="previewIndex >= 0" class="lightbox-counter">{{ previewIndex + 1 }} / {{ currentPreviewList.length }}</span>
+          </div>
+          <button class="icon-close" @click="previewImage = null" title="关闭 (Esc 键)">✕</button>
+        </div>
+        <div class="lightbox-body">
+          <img :src="imageUrl(previewImage.photo_id, false)" :alt="previewImage.filename" />
+        </div>
+        <div class="lightbox-footer">
+          <div class="lightbox-actions-left">
+            <button
+              v-if="currentPreviewList.length > 1"
+              class="secondary nav-btn"
+              :disabled="previewIndex <= 0"
+              @click="prevPreview"
+            >
+              ◀ 上一张
+            </button>
+            <button
+              v-if="currentPreviewList.length > 1"
+              class="secondary nav-btn"
+              :disabled="previewIndex < 0 || previewIndex >= currentPreviewList.length - 1"
+              @click="nextPreview"
+            >
+              下一张 ▶
+            </button>
+          </div>
+          <div class="lightbox-actions-right">
+            <button
+              v-if="activeSlot && activeSlot.confirmed_photo_ids.includes(previewImage.photo_id)"
+              class="btn-confirmed"
+              disabled
+            >
+              ✓ 当前已选用
+            </button>
+            <button
+              v-else-if="activeSlot && activeView === 'checklist'"
+              class="btn-use"
+              @click="usePhoto(previewImage); previewImage = null"
+            >
+              选用此照片
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <button
+        v-if="currentPreviewList.length > 1"
+        class="lightbox-nav-btn next"
+        :disabled="previewIndex < 0 || previewIndex >= currentPreviewList.length - 1"
+        @click.stop="nextPreview"
+        title="下一张 (→ 键)"
+      >
+        ❯
+      </button>
+    </div>
     <div v-if="showCreate" class="modal-wrap"><form class="modal" @submit.prevent="createProject"><div class="modal-title"><h2>新建工厂项目</h2><button type="button" class="icon-close" @click="showCreate = false">✕</button></div><label>工厂名称<input v-model="form.factory_name" required placeholder="例如：浙江某某科技有限公司" /></label><label>本工厂图库文件夹<span class="file-input"><input v-model="form.gallery_path" required placeholder="D:\\Audit\\Photos" /><button type="button" class="secondary" @click="chooseFolder">浏览</button></span></label><label>清单类型<select v-model="form.checklist_type_id"><option v-for="type in checklistTypes" :key="type.id" :value="type.id">{{ type.label }} ({{ type.slot_count }} items)</option></select></label><p class="modal-tip">固定清单模板随程序分发；创建后会复制图库到项目专属目录。</p><button :disabled="loading" type="submit" class="modal-submit">创建并初始化图库</button></form></div>
+
+    <!-- 全图库选图抽屉 (Drawer) -->
+    <transition name="drawer">
+      <div v-if="showDrawer" class="drawer-backdrop" @click="closeDrawer">
+        <aside class="drawer-panel" @click.stop>
+          <header class="drawer-header">
+            <div class="drawer-header-info">
+              <p class="eyebrow">人工选图兜底 · 全图库挑选</p>
+              <h2>为「{{ activeSlot?.label || '当前项' }}」挑选照片</h2>
+              <p class="muted">
+                图库共 {{ galleryPhotos.length }} 张 · 当前筛选显示 {{ filteredDrawerPhotos.length }} 张
+                <span v-if="drawerOnlyUnused" class="filter-active-tag">（已隐藏已被选用的照片）</span>
+              </p>
+            </div>
+            <button class="icon-close" @click="closeDrawer" title="关闭抽屉 (Esc 键)">✕</button>
+          </header>
+
+          <div class="drawer-toolbar">
+            <div class="drawer-search-wrap">
+              <input
+                v-model="drawerSearch"
+                placeholder="按文件名或图片文字即时筛选..."
+              />
+              <button v-if="drawerSearch" class="btn-clear-search" @click="drawerSearch = ''">✕</button>
+            </div>
+            <label class="drawer-checkbox-label">
+              <input type="checkbox" v-model="drawerOnlyUnused" />
+              <span>隐藏已被其他项选用的照片</span>
+            </label>
+          </div>
+
+          <div v-if="!filteredDrawerPhotos.length" class="drawer-empty">
+            <div class="drawer-empty-icon">📂</div>
+            <p>未找到符合筛选条件的照片</p>
+            <button
+              v-if="drawerSearch || drawerOnlyUnused"
+              class="secondary"
+              @click="drawerSearch = ''; drawerOnlyUnused = false"
+            >
+              清除所有筛选条件
+            </button>
+          </div>
+
+          <div v-else class="drawer-grid">
+            <article
+              v-for="photo in filteredDrawerPhotos"
+              :key="photo.photo_id"
+              :class="['photo-card', 'drawer-card', { 'card-confirmed': activeSlot?.confirmed_photo_ids.includes(photo.photo_id) }]"
+            >
+              <div class="img-wrapper" @click="previewImage = photo">
+                <img :src="imageUrl(photo.photo_id)" :alt="photo.filename" loading="lazy" />
+                <div class="img-overlay">🔍 点击放大</div>
+              </div>
+              <div class="photo-meta">
+                <strong :title="photo.filename">{{ photo.filename }}</strong>
+                <div class="meta-row">
+                  <span>清晰度 {{ Math.round(photo.quality_score * 100) }}</span>
+                  <span v-if="photo.ocr_status === 'done'" class="drawer-tag-ocr">已 OCR</span>
+                </div>
+                <small v-if="usedPhotoIds.has(photo.photo_id)" class="drawer-tag-used">
+                  ⚠️ 已被清单选用
+                </small>
+                <button
+                  v-if="activeSlot?.confirmed_photo_ids.includes(photo.photo_id)"
+                  class="btn-confirmed"
+                  disabled
+                >
+                  ✓ 当前项已选用
+                </button>
+                <button
+                  v-else
+                  class="btn-use"
+                  @click="selectPhotoFromDrawer(photo)"
+                >
+                  选用此照片
+                </button>
+              </div>
+            </article>
+          </div>
+        </aside>
+      </div>
+    </transition>
   </main>
 </template>

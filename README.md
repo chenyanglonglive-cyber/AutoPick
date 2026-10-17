@@ -1,6 +1,6 @@
 # AutoPick
 
-AutoPick 是本地运行的工厂审核清单选图工具。当前版本提供两份内置 Excel 清单：`quality_v1`（Quality Checklist，199 个图片字段）与 `social_audit_v1`（Social Audit Checklist，36 个预留图片字段）。同一工厂项目可在两个清单间切换，共享图库、图片向量和 OCR；每份清单分别匹配、确认、学习并导出 `.xlsx`。
+AutoPick 是本地运行的工厂审核清单选图工具。当前版本提供两份内置 Excel 清单：`quality_v1`（Quality Checklist，185 个唯一图片字段）与 `social_audit_v1`（Social Audit Checklist，26 个预留唯一图片字段）。同一工厂项目可在两个清单间切换，共享图库、图片向量和 OCR；每份清单分别匹配、确认、学习并导出 `.xlsx`。
 
 ## 启动
 

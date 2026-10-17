@@ -13,7 +13,8 @@ class ProjectCreate(BaseModel):
 
 
 class GalleryImportRequest(BaseModel):
-    gallery_path: str = Field(min_length=1, max_length=1000)
+    gallery_path: str | None = Field(default=None, max_length=1000)
+    file_paths: list[str] | None = None
 
 
 class ProjectDeleteRequest(BaseModel):
@@ -109,6 +110,7 @@ class ChecklistSlot(BaseModel):
     bookmark: str | None = None
     candidate_count: int = 0
     top_score: float | None = None
+    is_skipped: bool = False
 
 
 class ReportResponse(BaseModel):

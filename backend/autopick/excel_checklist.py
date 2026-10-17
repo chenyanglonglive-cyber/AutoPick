@@ -62,7 +62,7 @@ def _build_quality_slots(path: Path) -> tuple[ChecklistSlotSpec, ...]:
     ws = workbook["Photo report Tool"]
     slots: list[ChecklistSlotSpec] = []
     section = ""
-    occurrences: dict[str, int] = {}
+    seen_labels: set[str] = set()
     for row in range(1, ws.max_row + 1):
         a = ws.cell(row, 1)
         b = ws.cell(row, 2)
@@ -79,15 +79,18 @@ def _build_quality_slots(path: Path) -> tuple[ChecklistSlotSpec, ...]:
                 continue
             if label.lower() == "onsite:":
                 continue
+            normalized = label.lower()
+            if normalized in seen_labels:
+                continue
             image_row = cell.row - 1
             image_cell = f"{get_column_letter(cell.column)}{image_row}"
             if ws[image_cell].value is not None or ws.row_dimensions[image_row].height is None:
                 raise ValueError(f"固定清单图片位置校验失败: {ws.title}!{image_cell}")
-            occurrences[label] = occurrences.get(label, 0) + 1
-            item_key = f"quality_v1/{section or 'default'}/{cell.coordinate}/{occurrences[label]}"
+            seen_labels.add(normalized)
+            item_key = f"quality_v1/{section or 'default'}/{cell.coordinate}/1"
             slots.append(ChecklistSlotSpec(item_key, len(slots) + 1, section, label, ws.title, cell.coordinate, image_cell))
-    if len(slots) != 199:
-        raise ValueError(f"固定质量清单应有 199 个图片字段，实际发现 {len(slots)} 个")
+    if len(slots) != 185:
+        raise ValueError(f"固定质量清单应有 185 个唯一图片字段，实际发现 {len(slots)} 个")
     return tuple(slots)
 
 
@@ -96,7 +99,7 @@ def _build_social_audit_slots(path: Path) -> tuple[ChecklistSlotSpec, ...]:
     workbook = load_workbook(path, read_only=False, data_only=False)
     ws = workbook["Sheet1"]
     slots: list[ChecklistSlotSpec] = []
-    occurrences: dict[str, int] = {}
+    seen_labels: set[str] = set()
     part = ""
 
     for row in range(1, ws.max_row + 1):
@@ -120,12 +123,15 @@ def _build_social_audit_slots(path: Path) -> tuple[ChecklistSlotSpec, ...]:
             label = str(cell.value).strip()
             if not label:
                 continue
-            occurrences[label] = occurrences.get(label, 0) + 1
-            item_key = f"social_audit_v1/{part or 'default'}/{cell.coordinate}/{occurrences[label]}"
+            normalized = label.lower()
+            if normalized in seen_labels:
+                continue
+            seen_labels.add(normalized)
+            item_key = f"social_audit_v1/{part or 'default'}/{cell.coordinate}/1"
             slots.append(ChecklistSlotSpec(item_key, len(slots) + 1, part, label, ws.title, cell.coordinate, image_cell.coordinate))
 
-    if len(slots) != 36:
-        raise ValueError(f"固定社会审核清单应有 36 个图片字段，实际发现 {len(slots)} 个")
+    if len(slots) != 26:
+        raise ValueError(f"固定社会审核清单应有 26 个唯一图片字段，实际发现 {len(slots)} 个")
     return tuple(slots)
 
 

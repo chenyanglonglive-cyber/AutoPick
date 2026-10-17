@@ -19,7 +19,7 @@ Set-Location AutoPick
 ## 1. 项目定位与当前主流程
 
 - AutoPick 是本地运行的工厂审核清单选图工具。
-- 当前正式清单类型为 `quality_v1`（Quality Checklist，199 个图片字段）和 `social_audit_v1`（Social Audit Checklist，36 个预留图片字段）。
+- 当前正式清单类型为 `quality_v1`（Quality Checklist，185 个唯一图片字段）和 `social_audit_v1`（Social Audit Checklist，26 个预留唯一图片字段）。
 - 同一项目的图库、图片向量和 OCR 由所有清单共享；字段、候选、确认、别名、反馈与训练准备度按清单类型隔离。
 - 标准流程：导入图库 → 建立图片向量 → 本地 OCR（可选但推荐）→ 切换至所需清单重新匹配 → 人工复核 → 导出 `.xlsx`。
 - Word 最终报告仅用于导入历史样本、学习字段别名和比对结果；不作为日常导出格式。

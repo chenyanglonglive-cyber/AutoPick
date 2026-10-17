@@ -107,6 +107,7 @@ def test_high_confidence_candidate_is_automatically_confirmed(tmp_path: Path, mo
     monkeypatch.setattr(service, "_query_vector", lambda *_: np.r_[1.0, np.zeros(1023, dtype=np.float32)])
 
     service._compute_candidates(project["id"], slot["id"], slot["label"], 8)
+    service.confirm_all_top_candidates(project["id"])
     assert service.list_slots(project["id"])[0]["confirmed_photo_ids"] == [photo["id"]]
 
 

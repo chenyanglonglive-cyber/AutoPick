@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import random
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,7 +49,7 @@ class QwenEmbeddingClient:
         self.demo = demo
         self.max_retries = max_retries
         self.timeout = timeout
-        self._client: httpx.Client | None = None
+        self._local = threading.local()
 
     @staticmethod
     def _retry_delay(attempt: int) -> float:
@@ -56,8 +57,9 @@ class QwenEmbeddingClient:
         return min(2 ** (attempt - 1), 30.0) + random.uniform(0.1, 0.4)
 
     def _get_client(self) -> httpx.Client:
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.Client(
+        client = getattr(self._local, "client", None)
+        if client is None or client.is_closed:
+            client = httpx.Client(
                 timeout=httpx.Timeout(
                     connect=20.0,
                     read=self.timeout,
@@ -65,22 +67,24 @@ class QwenEmbeddingClient:
                     pool=30.0,
                 ),
                 limits=httpx.Limits(
-                    max_keepalive_connections=5,
-                    max_connections=10,
+                    max_keepalive_connections=15,
+                    max_connections=30,
                     keepalive_expiry=30.0,
                 ),
                 trust_env=True,
             )
-        return self._client
+            self._local.client = client
+        return client
 
     def _reset_client(self) -> None:
-        if self._client is not None:
+        client = getattr(self._local, "client", None)
+        if client is not None:
             try:
-                if not self._client.is_closed:
-                    self._client.close()
+                if not client.is_closed:
+                    client.close()
             except Exception:
                 pass
-            self._client = None
+            self._local.client = None
 
     def close(self) -> None:
         self._reset_client()

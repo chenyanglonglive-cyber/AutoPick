@@ -78,7 +78,7 @@ python -m backend.desktop
 
 ## 4. Product model the Agent must preserve
 
-- Built-in checklist types are `quality_v1` (Quality Checklist, 199 image fields) and `social_audit_v1` (Social Audit Checklist, 36 reserved image fields).
+- Built-in checklist types are `quality_v1` (Quality Checklist, 185 unique image fields) and `social_audit_v1` (Social Audit Checklist, 26 reserved unique image fields).
 - A factory project shares its gallery, image vectors, and OCR across checklist types.
 - Fields, candidates, confirmations, aliases, feedback, and training readiness are isolated by checklist type. Switching checklists must not mix their matching or learned data.
 - Automatic selection is one image to one field within the same checklist. Manual confirmation and different checklist types may explicitly reuse a photo.

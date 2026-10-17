@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
+from collections import defaultdict
 import re
 import shutil
 import sqlite3
@@ -191,7 +193,7 @@ class ProjectService:
             )
             self._insert_checklist_slots(db, checklist_type_id)
         self._sync_catalog([(slot.label, slot.section) for slot in checklist.slots])
-        self.import_gallery(project_id, gallery)
+        self.import_gallery(project_id, gallery, allow_batch_duplicates=True)
         return self.get_project(project_id)
 
     def _sync_catalog(self, items: Iterable[tuple[str, str | None]]) -> None:
@@ -199,17 +201,27 @@ class ProjectService:
             for label, _ in items:
                 db.execute("INSERT OR IGNORE INTO checklist_catalog(label, aliases_json) VALUES (?, '[]')", (label,))
 
-    def import_gallery(self, project_id: str, gallery: Path) -> dict:
+    def import_gallery(self, project_id: str, gallery: Path, allow_batch_duplicates: bool = False) -> dict:
         """Add only new image content from a source gallery to one project.
 
         SHA-256 is the stable content identity. Matching content already has
         local processing records, so it is not copied, vectorized, or OCR'd
         again when the source gallery is updated.
         """
-        root = self.project_root(project_id)
         images = sorted(path for path in gallery.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
         if not images:
             raise ValueError("图库中没有可用图片")
+        return self._import_image_files(project_id, images, allow_batch_duplicates=allow_batch_duplicates)
+
+    def import_photos(self, project_id: str, file_paths: list[Path], allow_batch_duplicates: bool = False) -> dict:
+        """Add only new image content from selected files to one project."""
+        images = [path.expanduser().resolve() for path in file_paths if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES]
+        if not images:
+            raise ValueError("未选择有效的图片文件")
+        return self._import_image_files(project_id, images, allow_batch_duplicates=allow_batch_duplicates)
+
+    def _import_image_files(self, project_id: str, images: list[Path], allow_batch_duplicates: bool = False) -> dict:
+        root = self.project_root(project_id)
         added_count = 0
         skipped_count = 0
         with connect(self.db_path(project_id)) as db:
@@ -219,10 +231,6 @@ class ProjectService:
             for source in images:
                 inspection = inspect_image(source)
                 existing = known_hashes.get(inspection.sha256)
-                # Only skip content that was already part of this project
-                # before this update.  Two files with the same content in one
-                # newly imported batch remain visible as separate gallery
-                # photos and can share the first photo's vector as before.
                 if inspection.sha256 in existing_hashes:
                     skipped_count += 1
                     continue
@@ -255,12 +263,19 @@ class ProjectService:
                     ),
                 )
                 known_hashes[inspection.sha256] = photo_id
+                if not allow_batch_duplicates:
+                    existing_hashes.add(inspection.sha256)
                 known_dhashes.append((photo_id, inspection.dhash))
                 added_count += 1
+        if added_count > 0:
+            dup_suffix = f"，已自动跳过 {skipped_count} 张重复照片" if skipped_count > 0 else ""
+            msg = f"图库已更新：成功新增 {added_count} 张图片{dup_suffix}。请为新增图片建立向量和本地 OCR。"
+        else:
+            msg = f"图库未更新：已自动跳过 {skipped_count} 张已有重复照片。"
         return {
             "added_count": added_count,
             "skipped_count": skipped_count,
-            "message": f"图库已更新：新增 {added_count} 张，已跳过 {skipped_count} 张已有图片。请为新增图片建立向量和本地 OCR。",
+            "message": msg,
         }
 
     def list_projects(self) -> list[dict]:
@@ -423,37 +438,51 @@ class ProjectService:
                     rows = db.execute(
                         "SELECT p.* FROM photos p LEFT JOIN embeddings e ON e.photo_id=p.id WHERE e.photo_id IS NULL AND p.duplicate_of IS NULL ORDER BY p.created_at"
                     ).fetchall()
-                for ordinal, row in enumerate(rows, start=1):
-                    self._raise_if_job_cancelled(project_id, job_id)
-                    original = self.safe_photo_path(project_id, row["id"])
-                    derivative = root / "derived" / "embedding" / f"{row['id']}__{row['source_filename']}.jpg"
-                    make_derivative(original, derivative, 1024, 82)
-                    result = client.embed_image(derivative)
-                    with connect(self.db_path(project_id)) as db:
-                        db.execute(
-                            "INSERT OR REPLACE INTO embeddings VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (
-                                row["id"],
-                                self.settings.embedding_model,
-                                self.settings.embedding_dimension,
-                                PREPROCESS_VERSION,
-                                result.vector.astype(np.float32).tobytes(),
-                                result.input_tokens,
-                                utcnow(),
-                            ),
-                        )
-                        db.execute(
-                            "UPDATE photos SET embedding_relative_path=?, indexed_at=? WHERE id=?",
-                            (derivative.relative_to(root).as_posix(), utcnow(), row["id"]),
-                        )
-                        db.execute(
-                            "INSERT INTO api_usage VALUES (?, ?, ?, 'image_embedding', ?, ?, 'success', NULL, ?)",
-                            (str(uuid.uuid4()), job_id, row["id"], self.settings.embedding_model, result.input_tokens, utcnow()),
-                        )
-                        db.execute(
-                            "UPDATE jobs SET current=?, actual_tokens=actual_tokens+?, message=?, updated_at=? WHERE id=?",
-                            (ordinal, result.input_tokens, f"图片向量化：{ordinal}/{len(rows)} 张待处理图片", utcnow(), job_id),
-                        )
+                if rows:
+                    workers = min(self.settings.embedding_workers, len(rows))
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                        def _embed_task(photo_row):
+                            orig = self.safe_photo_path(project_id, photo_row["id"])
+                            deriv = root / "derived" / "embedding" / f"{photo_row['id']}__{photo_row['source_filename']}.jpg"
+                            make_derivative(orig, deriv, 1024, 82)
+                            res = client.embed_image(deriv)
+                            return photo_row, deriv, res
+
+                        futures = [executor.submit(_embed_task, r) for r in rows]
+                        ordinal = 0
+                        try:
+                            for future in concurrent.futures.as_completed(futures):
+                                self._raise_if_job_cancelled(project_id, job_id)
+                                row, derivative, result = future.result()
+                                ordinal += 1
+                                with connect(self.db_path(project_id)) as db:
+                                    db.execute(
+                                        "INSERT OR REPLACE INTO embeddings VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                        (
+                                            row["id"],
+                                            self.settings.embedding_model,
+                                            self.settings.embedding_dimension,
+                                            PREPROCESS_VERSION,
+                                            result.vector.astype(np.float32).tobytes(),
+                                            result.input_tokens,
+                                            utcnow(),
+                                        ),
+                                    )
+                                    db.execute(
+                                        "UPDATE photos SET embedding_relative_path=?, indexed_at=? WHERE id=?",
+                                        (derivative.relative_to(root).as_posix(), utcnow(), row["id"]),
+                                    )
+                                    db.execute(
+                                        "INSERT INTO api_usage VALUES (?, ?, ?, 'image_embedding', ?, ?, 'success', NULL, ?)",
+                                        (str(uuid.uuid4()), job_id, row["id"], self.settings.embedding_model, result.input_tokens, utcnow()),
+                                    )
+                                    db.execute(
+                                        "UPDATE jobs SET current=?, actual_tokens=actual_tokens+?, message=?, updated_at=? WHERE id=?",
+                                        (ordinal, result.input_tokens, f"图片向量化：{ordinal}/{len(rows)} 张待处理图片", utcnow(), job_id),
+                                    )
+                        except JobCancelled:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            raise
                 self._raise_if_job_cancelled(project_id, job_id)
                 self._copy_exact_duplicate_vectors(project_id)
                 if include_ocr:
@@ -465,19 +494,34 @@ class ProjectService:
                             "UPDATE jobs SET current=0, total=?, message='本地 OCR：准备识别待处理图片', updated_at=? WHERE id=?",
                             (len(ocr_rows), utcnow(), job_id),
                         )
-                    ocr_client = LocalOcrClient()
-                    for ordinal, row in enumerate(ocr_rows, start=1):
-                        self._raise_if_job_cancelled(project_id, job_id)
-                        original = self.safe_photo_path(project_id, row["id"])
-                        derivative = root / "derived" / "ocr" / f"{row['id']}__{row['source_filename']}.jpg"
-                        make_derivative(original, derivative, 1600, 90)
-                        text = ocr_client.extract_text(derivative)
-                        with connect(self.db_path(project_id)) as db:
-                            db.execute("INSERT OR REPLACE INTO ocr_results VALUES (?, ?, ?)", (row["id"], text, utcnow()))
-                            db.execute(
-                                "UPDATE jobs SET current=?, message=?, updated_at=? WHERE id=?",
-                                (ordinal, f"本地 OCR：{ordinal}/{len(ocr_rows)} 张待处理图片", utcnow(), job_id),
-                            )
+                    if ocr_rows:
+                        ocr_client = LocalOcrClient()
+                        ocr_long_edge = self.settings.ocr_long_edge
+                        ocr_workers = min(self.settings.ocr_workers, len(ocr_rows))
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=ocr_workers) as executor:
+                            def _ocr_task(photo_row):
+                                orig = self.safe_photo_path(project_id, photo_row["id"])
+                                deriv = root / "derived" / "ocr" / f"{photo_row['id']}__{photo_row['source_filename']}.jpg"
+                                make_derivative(orig, deriv, ocr_long_edge, 85)
+                                txt = ocr_client.extract_text(deriv)
+                                return photo_row, txt
+
+                            futures = [executor.submit(_ocr_task, r) for r in ocr_rows]
+                            ordinal = 0
+                            try:
+                                for future in concurrent.futures.as_completed(futures):
+                                    self._raise_if_job_cancelled(project_id, job_id)
+                                    row, text = future.result()
+                                    ordinal += 1
+                                    with connect(self.db_path(project_id)) as db:
+                                        db.execute("INSERT OR REPLACE INTO ocr_results VALUES (?, ?, ?)", (row["id"], text, utcnow()))
+                                        db.execute(
+                                            "UPDATE jobs SET current=?, message=?, updated_at=? WHERE id=?",
+                                            (ordinal, f"本地 OCR：{ordinal}/{len(ocr_rows)} 张待处理图片", utcnow(), job_id),
+                                        )
+                            except JobCancelled:
+                                executor.shutdown(wait=False, cancel_futures=True)
+                                raise
                     self._raise_if_job_cancelled(project_id, job_id)
                     self._copy_exact_duplicate_ocr(project_id)
                 else:
@@ -491,15 +535,8 @@ class ProjectService:
                         )
                     else:
                         db.execute("UPDATE jobs SET message='开始按清单匹配候选照片', updated_at=? WHERE id=?", (utcnow(), job_id))
-                for ordinal, slot in enumerate(slots, start=1):
+                def _match_progress(ordinal: int, slot: Any) -> None:
                     self._raise_if_job_cancelled(project_id, job_id)
-                    try:
-                        with connect(self.settings.global_db) as global_db:
-                            aliases = [row["alias"] for row in global_db.execute("SELECT alias FROM checklist_aliases WHERE checklist_type_id=? AND item_key=?", (slot["checklist_type_id"], slot["item_key"] or slot["id"])).fetchall()]
-                        query = " ".join([slot["label"], *aliases])
-                        self._compute_candidates(project_id, slot["id"], query, 8)
-                    except Exception:
-                        pass
                     with connect(self.db_path(project_id)) as db:
                         db.execute(
                             "UPDATE jobs SET current=?, total=?, message=?, updated_at=? WHERE id=?",
@@ -511,6 +548,8 @@ class ProjectService:
                                 job_id,
                             ),
                         )
+
+                self._batch_compute_candidates(project_id, slots, top_k=8, progress_callback=_match_progress)
                 self._raise_if_job_cancelled(project_id, job_id)
                 for checklist_type_id in {slot["checklist_type_id"] for slot in slots}:
                     self._clear_unsuitable_system_confirmations(project_id, checklist_type_id)
@@ -611,12 +650,14 @@ class ProjectService:
                     "SELECT id, label, item_key, checklist_type_id FROM checklist_slots WHERE checklist_type_id=? ORDER BY ordinal",
                     (checklist_type_id,),
                 ).fetchall()
-            for ordinal, slot in enumerate(slots, start=1):
-                with connect(self.settings.global_db) as global_db:
-                    aliases = [row["alias"] for row in global_db.execute("SELECT alias FROM checklist_aliases WHERE checklist_type_id=? AND item_key=?", (slot["checklist_type_id"], slot["item_key"] or slot["id"])).fetchall()]
-                self._compute_candidates(project_id, slot["id"], " ".join([slot["label"], *aliases]), 8)
+            def _progress(ordinal: int, slot: Any) -> None:
                 with connect(self.db_path(project_id)) as db:
-                    db.execute("UPDATE jobs SET current=?, message=?, updated_at=? WHERE id=?", (ordinal, f"正在匹配清单 {ordinal}/{len(slots)}：{slot['label']}", utcnow(), job_id))
+                    db.execute(
+                        "UPDATE jobs SET current=?, message=?, updated_at=? WHERE id=?",
+                        (ordinal, f"正在匹配清单 {ordinal}/{len(slots)}：{slot['label']}", utcnow(), job_id),
+                    )
+
+            self._batch_compute_candidates(project_id, slots, top_k=8, progress_callback=_progress)
             self._clear_unsuitable_system_confirmations(project_id, checklist_type_id)
             self._deduplicate_system_confirmations(project_id, checklist_type_id)
             selected = self.confirm_all_top_candidates(project_id, checklist_type_id)
@@ -635,17 +676,28 @@ class ProjectService:
                 rows = db.execute(
                     "SELECT p.* FROM photos p LEFT JOIN ocr_results o ON o.photo_id=p.id WHERE o.photo_id IS NULL AND p.duplicate_of IS NULL ORDER BY p.created_at"
                 ).fetchall()
-            for ordinal, row in enumerate(rows, start=1):
-                original = self.safe_photo_path(project_id, row["id"])
-                derivative = root / "derived" / "ocr" / f"{row['id']}__{row['source_filename']}.jpg"
-                make_derivative(original, derivative, 1600, 90)
-                text = client.extract_text(derivative)
-                with connect(self.db_path(project_id)) as db:
-                    db.execute("INSERT OR REPLACE INTO ocr_results VALUES (?, ?, ?)", (row["id"], text, utcnow()))
-                    db.execute(
-                        "UPDATE jobs SET current=?, message=?, updated_at=? WHERE id=?",
-                        (ordinal, f"本地 OCR 已识别 {ordinal}/{len(rows)} 张图片", utcnow(), job_id),
-                    )
+            if rows:
+                workers = min(self.settings.ocr_workers, len(rows))
+                ocr_long_edge = self.settings.ocr_long_edge
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                    def _ocr_task(photo_row):
+                        orig = self.safe_photo_path(project_id, photo_row["id"])
+                        deriv = root / "derived" / "ocr" / f"{photo_row['id']}__{photo_row['source_filename']}.jpg"
+                        make_derivative(orig, deriv, ocr_long_edge, 85)
+                        txt = client.extract_text(deriv)
+                        return photo_row, txt
+
+                    futures = [executor.submit(_ocr_task, r) for r in rows]
+                    ordinal = 0
+                    for future in concurrent.futures.as_completed(futures):
+                        row, text = future.result()
+                        ordinal += 1
+                        with connect(self.db_path(project_id)) as db:
+                            db.execute("INSERT OR REPLACE INTO ocr_results VALUES (?, ?, ?)", (row["id"], text, utcnow()))
+                            db.execute(
+                                "UPDATE jobs SET current=?, message=?, updated_at=? WHERE id=?",
+                                (ordinal, f"本地 OCR 已识别 {ordinal}/{len(rows)} 张图片", utcnow(), job_id),
+                            )
             self._copy_exact_duplicate_ocr(project_id)
             with connect(self.db_path(project_id)) as db:
                 db.execute("UPDATE jobs SET status='completed', message='本地文字索引已完成，可重新匹配清单', updated_at=? WHERE id=?", (utcnow(), job_id))
@@ -677,7 +729,8 @@ class ProjectService:
             result = []
             for row in rows:
                 confirmed = db.execute("SELECT photo_id FROM confirmations WHERE slot_id=?", (row["id"],)).fetchall()
-                result.append({**dict(row), "confirmed_photo_ids": [value["photo_id"] for value in confirmed]})
+                is_skipped = bool(db.execute("SELECT 1 FROM rejections WHERE slot_id=? AND reason='skipped'", (row["id"],)).fetchone())
+                result.append({**dict(row), "confirmed_photo_ids": [value["photo_id"] for value in confirmed], "is_skipped": is_skipped})
             return result
 
     def list_gallery(self, project_id: str) -> list[dict]:
@@ -850,6 +903,102 @@ class ProjectService:
                     (slot_id, row["id"], semantic_score, row["quality_score"], total, rank, utcnow()),
                 )
 
+    def _batch_compute_candidates(
+        self,
+        project_id: str,
+        slots: list[sqlite3.Row | dict],
+        top_k: int = 8,
+        progress_callback: Any = None,
+    ) -> None:
+        if not slots:
+            return
+        matrix, rows = self._vectors_and_photo_rows(project_id)
+        with connect(self.db_path(project_id)) as db:
+            ocr_dict = {row["photo_id"]: row["text"] for row in db.execute("SELECT photo_id, text FROM ocr_results")}
+            rejections_raw = db.execute("SELECT slot_id, photo_id FROM rejections").fetchall()
+            rejections_by_slot: dict[str, set[str]] = defaultdict(set)
+            for r in rejections_raw:
+                rejections_by_slot[r["slot_id"]].add(r["photo_id"])
+
+        checklist_types = {s["checklist_type_id"] for s in slots}
+        weights_by_type: dict[str, dict[str, float]] = {}
+        aliases_by_slot: dict[tuple[str, str], list[str]] = defaultdict(list)
+        with connect(self.settings.global_db) as global_db:
+            for c_type in checklist_types:
+                profile = global_db.execute("SELECT weights_json FROM preference_profiles WHERE name=?", (c_type,)).fetchone()
+                w = {**DEFAULT_MATCH_WEIGHTS, **(json.loads(profile["weights_json"]) if profile else {})}
+                weights_by_type[c_type] = {
+                    "semantic": float(w.get("semantic", DEFAULT_MATCH_WEIGHTS["semantic"])),
+                    "quality": float(w.get("quality", DEFAULT_MATCH_WEIGHTS["quality"])),
+                    "ocr": float(w.get("ocr", DEFAULT_MATCH_WEIGHTS["ocr"])),
+                }
+            for row in global_db.execute("SELECT checklist_type_id, item_key, alias FROM checklist_aliases"):
+                aliases_by_slot[(row["checklist_type_id"], row["item_key"])].append(row["alias"])
+
+        slot_queries: list[tuple[Any, str]] = []
+        for slot in slots:
+            item_key = slot["item_key"] or slot["id"]
+            aliases = aliases_by_slot.get((slot["checklist_type_id"], item_key), [])
+            query = " ".join([slot["label"], *aliases])
+            slot_queries.append((slot, query))
+
+        cached_vectors: dict[str, np.ndarray] = {}
+        with connect(self.db_path(project_id)) as db:
+            for _, query in slot_queries:
+                norm_q = " ".join(query.split()).strip().lower()
+                if norm_q not in cached_vectors:
+                    cached = db.execute("SELECT vector FROM search_cache WHERE query=?", (norm_q,)).fetchone()
+                    if cached:
+                        cached_vectors[norm_q] = np.frombuffer(cached["vector"], dtype=np.float32)
+
+        for _, query in slot_queries:
+            norm_q = " ".join(query.split()).strip().lower()
+            if norm_q not in cached_vectors:
+                cached_vectors[norm_q] = self._query_vector(project_id, query)
+
+        all_candidates_to_insert: list[tuple] = []
+        slot_ids = [s["id"] for s in slots]
+        now = utcnow()
+
+        for ordinal, (slot, query) in enumerate(slot_queries, start=1):
+            norm_q = " ".join(query.split()).strip().lower()
+            query_vector = cached_vectors[norm_q]
+            semantic = matrix @ query_vector
+            weights = weights_by_type.get(slot["checklist_type_id"], DEFAULT_MATCH_WEIGHTS)
+            sem_w = weights["semantic"]
+            ocr_w = weights["ocr"]
+            qual_w = weights["quality"]
+            slot_rejections = rejections_by_slot.get(slot["id"], set())
+
+            ranked: list[tuple[float, float, sqlite3.Row]] = []
+            for index, row in enumerate(rows):
+                if row["id"] in slot_rejections:
+                    continue
+                quality = float(row["quality_score"])
+                duplicate_penalty = 0.05 if row["near_duplicate_group"] else 0.0
+                ocr_score = self._ocr_match_score(query, ocr_dict.get(row["id"], ""))
+                total = (
+                    sem_w * float(semantic[index])
+                    + ocr_w * ocr_score
+                    + qual_w * quality
+                    - duplicate_penalty
+                )
+                ranked.append((total, float(semantic[index]), row))
+
+            ranked.sort(key=lambda item: item[0], reverse=True)
+            for rank, (total, semantic_score, row) in enumerate(ranked[:top_k], start=1):
+                all_candidates_to_insert.append(
+                    (slot["id"], row["id"], semantic_score, row["quality_score"], total, rank, now)
+                )
+
+            if progress_callback:
+                progress_callback(ordinal, slot)
+
+        with connect(self.db_path(project_id)) as db:
+            for s_id in slot_ids:
+                db.execute("DELETE FROM candidates WHERE slot_id=?", (s_id,))
+            db.executemany("INSERT INTO candidates VALUES (?, ?, ?, ?, ?, ?, ?)", all_candidates_to_insert)
+
     def search(self, project_id: str, query: str, top_k: int, checklist_type_id: str | None = None) -> list[dict]:
         query_vector = self._query_vector(project_id, query)
         matrix, rows = self._vectors_and_photo_rows(project_id)
@@ -857,10 +1006,16 @@ class ProjectService:
         ranked: list[tuple[float, float, sqlite3.Row, bool]] = []
         with connect(self.db_path(project_id)) as db:
             ocr = {row["photo_id"]: row["text"].lower() for row in db.execute("SELECT photo_id, text FROM ocr_results")}
+        clean_query = "".join(query.lower().split())
         for index, row in enumerate(rows):
-            ocr_score = self._ocr_match_score(query, ocr.get(row["id"], ""))
-            score = 0.70 * float(semantic[index]) + 0.25 * ocr_score + 0.05 * float(row["quality_score"])
-            ranked.append((score, float(semantic[index]), row, bool(ocr_score)))
+            ocr_text = ocr.get(row["id"], "")
+            ocr_score = self._ocr_match_score(query, ocr_text)
+            filename_hit = clean_query in row["source_filename"].lower() if clean_query else False
+            # When user manually searches keywords, OCR or filename text hits should be strongly rewarded
+            exact_hit = bool(clean_query and (clean_query in ocr_text or filename_hit))
+            text_score = 1.0 if exact_hit else ocr_score
+            score = 0.45 * float(semantic[index]) + 0.50 * text_score + 0.05 * float(row["quality_score"])
+            ranked.append((score, float(semantic[index]), row, bool(ocr_score or filename_hit)))
         ranked.sort(key=lambda item: item[0], reverse=True)
         synthetic = []
         for rank, (score, semantic_score, row, ocr_hit) in enumerate(ranked[:top_k], start=1):
@@ -910,6 +1065,7 @@ class ProjectService:
                    WHERE s.checklist_type_id=?
                      AND NOT EXISTS (SELECT 1 FROM confirmations x WHERE x.slot_id=s.id)
                      AND NOT EXISTS (SELECT 1 FROM rejections r WHERE r.slot_id=s.id AND r.photo_id=c.photo_id)
+                     AND NOT EXISTS (SELECT 1 FROM rejections r WHERE r.slot_id=s.id AND r.reason='skipped')
                      AND c.total_score>=?
                      AND c.semantic_score>=?
                    ORDER BY c.total_score DESC, c.rank ASC, s.ordinal""",
@@ -998,6 +1154,7 @@ class ProjectService:
                     raise ValueError("照片文件校验失败，无法确认")
             system = db.execute("SELECT photo_id FROM confirmations WHERE slot_id=? ORDER BY confirmed_at LIMIT 1", (slot_id,)).fetchone()
             db.execute("DELETE FROM confirmations WHERE slot_id=?", (slot_id,))
+            db.execute("DELETE FROM rejections WHERE slot_id=? AND reason='skipped'", (slot_id,))
             for photo_id in photo_ids:
                 db.execute(
                     "INSERT INTO confirmations(slot_id, photo_id, confirmed_at, source, search_query, system_photo_id) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1024,6 +1181,22 @@ class ProjectService:
                 "INSERT OR REPLACE INTO rejections VALUES (?, ?, ?, ?)",
                 (slot_id, photo_id, reason, utcnow()),
             )
+
+    def skip_slot(self, project_id: str, slot_id: str) -> None:
+        self.project_root(project_id)
+        with connect(self.db_path(project_id)) as db:
+            if not db.execute("SELECT 1 FROM checklist_slots WHERE id=?", (slot_id,)).fetchone():
+                raise ValueError("清单项目不存在")
+            db.execute("DELETE FROM confirmations WHERE slot_id=?", (slot_id,))
+            db.execute(
+                "INSERT OR REPLACE INTO rejections(slot_id, photo_id, reason, rejected_at) VALUES (?, '__SKIPPED__', 'skipped', ?)",
+                (slot_id, utcnow()),
+            )
+
+    def unskip_slot(self, project_id: str, slot_id: str) -> None:
+        self.project_root(project_id)
+        with connect(self.db_path(project_id)) as db:
+            db.execute("DELETE FROM rejections WHERE slot_id=? AND reason='skipped'", (slot_id,))
 
     def import_excel_feedback(self, project_id: str, feedback_path: str) -> dict:
         """Record retained and deleted images against their original export batch."""
@@ -1417,6 +1590,21 @@ class ProjectService:
             photo = db.execute("SELECT relative_path FROM photos WHERE id=?", (photo_id,)).fetchone()
             if not photo:
                 raise ValueError("照片不属于当前项目")
+        return self._safe_relative(root, photo["relative_path"])
+
+    def safe_thumbnail_path(self, project_id: str, photo_id: str) -> Path:
+        root = self.project_root(project_id)
+        with connect(self.db_path(project_id)) as db:
+            photo = db.execute("SELECT source_filename, relative_path, embedding_relative_path FROM photos WHERE id=?", (photo_id,)).fetchone()
+            if not photo:
+                raise ValueError("照片不属于当前项目")
+        if photo["embedding_relative_path"]:
+            candidate = root / photo["embedding_relative_path"]
+            if candidate.is_file():
+                return self._safe_relative(root, photo["embedding_relative_path"])
+        fallback_deriv = root / "derived" / "embedding" / f"{photo_id}__{photo['source_filename']}.jpg"
+        if fallback_deriv.is_file():
+            return self._safe_relative(root, f"derived/embedding/{photo_id}__{photo['source_filename']}.jpg")
         return self._safe_relative(root, photo["relative_path"])
 
     @staticmethod

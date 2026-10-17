@@ -29,3 +29,19 @@ def test_does_not_reuse_stale_local_api_version():
 
     with patch("backend.desktop.urlopen", return_value=response):
         assert _existing_autopick_url() is None
+
+
+def test_desktop_bridge_exposes_select_photos():
+    from backend.desktop import DesktopBridge
+    bridge = DesktopBridge()
+    assert "select_photos" in DesktopBridge._EXPOSED
+    assert "select_photos" in dir(bridge)
+
+    class FakeWindow:
+        def create_file_dialog(self, dialog_type, allow_multiple=False, file_types=()):
+            assert allow_multiple is True
+            return ("D:\\photos\\a.jpg", "D:\\photos\\b.jpg")
+
+    bridge.window = FakeWindow()
+    selected = bridge.select_photos()
+    assert selected == ["D:\\photos\\a.jpg", "D:\\photos\\b.jpg"]

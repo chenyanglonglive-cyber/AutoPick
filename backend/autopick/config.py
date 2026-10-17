@@ -19,6 +19,9 @@ class Settings:
     token_budget: int = 500_000
     qwen_max_retries: int = 8
     training_feedback_threshold: int = 500
+    ocr_long_edge: int = 1024
+    ocr_workers: int = 2
+    embedding_workers: int = 4
 
     @property
     def global_db(self) -> Path:
@@ -54,4 +57,7 @@ def load_settings() -> Settings:
         session_token=secrets.token_urlsafe(32),
         qwen_max_retries=max(1, int(os.getenv("AUTOPICK_QWEN_MAX_RETRIES", "8"))),
         training_feedback_threshold=max(1, int(os.getenv("AUTOPICK_TRAINING_FEEDBACK_THRESHOLD", "500"))),
+        ocr_long_edge=max(512, int(os.getenv("AUTOPICK_OCR_IMAGE_SIZE", "1024"))),
+        ocr_workers=max(1, int(os.getenv("AUTOPICK_OCR_WORKERS", "2"))),
+        embedding_workers=max(1, int(os.getenv("AUTOPICK_EMBEDDING_WORKERS", "4"))),
     )

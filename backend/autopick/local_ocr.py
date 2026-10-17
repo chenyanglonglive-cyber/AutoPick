@@ -13,20 +13,24 @@ class LocalOcrClient:
 
     _engine: object | None = None
     _engine_lock = threading.Lock()
+    _local = threading.local()
 
     @classmethod
     def _get_engine(cls) -> object:
-        if cls._engine is None:
+        if cls._engine is not None:
+            return cls._engine
+        engine = getattr(cls._local, "engine", None)
+        if engine is None:
             with cls._engine_lock:
-                if cls._engine is None:
-                    try:
-                        from rapidocr import RapidOCR
-                    except ImportError as exc:  # pragma: no cover - installation error
-                        raise LocalOcrError(
-                            "本地 OCR 组件未安装。请执行：python -m pip install -r requirements.txt"
-                        ) from exc
-                    cls._engine = RapidOCR()
-        return cls._engine
+                try:
+                    from rapidocr import RapidOCR
+                except ImportError as exc:  # pragma: no cover - installation error
+                    raise LocalOcrError(
+                        "本地 OCR 组件未安装。请执行：python -m pip install -r requirements.txt"
+                    ) from exc
+                engine = RapidOCR()
+                cls._local.engine = engine
+        return engine
 
     def extract_text(self, image_path: Path) -> str:
         """Return normalized text recognised entirely on the local machine."""

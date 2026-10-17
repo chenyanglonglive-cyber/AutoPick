@@ -43,7 +43,7 @@ class DesktopBridge:
     with ``No method matches given arguments for Rectangle.op_Equality``.
     """
 
-    _EXPOSED = ("select_folder", "select_feedback_file", "open_data_folder")
+    _EXPOSED = ("select_folder", "select_photos", "select_feedback_file", "open_data_folder")
 
     def __init__(self, data_root=None) -> None:
         self.window = None
@@ -57,6 +57,16 @@ class DesktopBridge:
 
         result = self.window.create_file_dialog(webview.FOLDER_DIALOG)
         return result[0] if result else None
+
+    def select_photos(self):
+        import webview
+
+        result = self.window.create_file_dialog(
+            webview.OPEN_DIALOG,
+            allow_multiple=True,
+            file_types=("图片文件 (*.jpg;*.jpeg;*.png;*.webp;*.bmp)", "所有文件 (*.*)"),
+        )
+        return list(result) if result else None
 
     def select_feedback_file(self):
         import webview
