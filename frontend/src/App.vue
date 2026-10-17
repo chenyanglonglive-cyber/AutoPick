@@ -455,7 +455,7 @@ onUnmounted(() => {
               :class="['photo-card', 'drawer-card', { 'card-confirmed': activeSlot?.confirmed_photo_ids.includes(photo.photo_id) }]"
             >
               <div class="img-wrapper" @click="previewImage = photo">
-                <img :src="imageUrl(photo.photo_id)" :alt="photo.filename" loading="lazy" />
+                <img :src="imageUrl(photo.photo_id)" :alt="photo.filename" loading="eager" />
                 <div class="img-overlay">🔍 点击放大</div>
               </div>
               <div class="photo-meta">
