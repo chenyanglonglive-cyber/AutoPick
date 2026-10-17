@@ -232,3 +232,41 @@ def test_import_photos_multi_selection_and_deduplication(tmp_path: Path) -> None
     assert res_again["added_count"] == 0
     assert res_again["skipped_count"] == 3
     assert "已自动跳过 3 张已有重复照片" in res_again["message"]
+
+
+def test_dynamic_document_ocr_weights() -> None:
+    from backend.autopick.services import is_document_slot, resolve_slot_weights, DOCUMENT_MATCH_WEIGHTS, DEFAULT_MATCH_WEIGHTS
+
+    # 证书、报告、执照、单据类槽位应识别为 Document 类
+    assert is_document_slot("ISO9001:2015证书") is True
+    assert is_document_slot("营业执照 Business Licenses") is True
+    assert is_document_slot("电池测试证书") is True
+    assert is_document_slot("校准报告 Calibration report") is True
+    assert is_document_slot("特种设备检测记录") is True
+    assert is_document_slot("排污许可合同") is True
+
+    # 现场场景类或区域类槽位应识别为 Scene 类
+    assert is_document_slot("Auditor") is False
+    assert is_document_slot("Factory Gate") is False
+    assert is_document_slot("厂房大门") is False
+    assert is_document_slot("消火栓") is False
+    assert is_document_slot("IQC检验区") is False
+    assert is_document_slot("功能测试区") is False
+
+    # 权重解析验证：文书类在有 OCR 记录时 OCR 权重提升至 55%，视觉语义 35%
+    doc_weights = resolve_slot_weights("ISO9001证书", has_ocr=True)
+    assert doc_weights["ocr"] == 0.55
+    assert doc_weights["semantic"] == 0.35
+    assert doc_weights["quality"] == 0.10
+
+    # 若尚未执行 OCR，回退到默认基准权重，避免惩罚纯向量匹配
+    no_ocr_weights = resolve_slot_weights("ISO9001证书", has_ocr=False)
+    assert no_ocr_weights["ocr"] == 0.28
+    assert no_ocr_weights["semantic"] == 0.62
+    assert no_ocr_weights["quality"] == 0.10
+
+    # 现场场景类槽位保持默认权重（语义主导 62%，OCR 辅助 28%）
+    scene_weights = resolve_slot_weights("车间消火栓", has_ocr=True)
+    assert scene_weights["ocr"] == 0.28
+    assert scene_weights["semantic"] == 0.62
+    assert scene_weights["quality"] == 0.10

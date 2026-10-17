@@ -38,6 +38,48 @@ from backend.autopick.excel_checklist import copy_template, get_checklist_type, 
 
 
 DEFAULT_MATCH_WEIGHTS = {"semantic": 0.62, "quality": 0.10, "ocr": 0.28}
+DOCUMENT_MATCH_WEIGHTS = {"semantic": 0.35, "quality": 0.10, "ocr": 0.55}
+DOCUMENT_KEYWORDS = (
+    "证书", "certificate", "cert",
+    "报告", "report",
+    "执照", "license",
+    "记录", "record",
+    "清单", "list",
+    "表", "table", "chart",
+    "单", "form",
+    "许可", "permit",
+    "合同", "contract",
+    "规程", "procedure",
+    "制度", "policy",
+    "资质", "qualification",
+    "认证", "certification",
+    "合格证",
+    "校准", "calibration",
+    "检定", "verification",
+    "批复", "approval",
+    "复印件", "copy",
+    "台账", "ledger",
+    "档案", "archive",
+    "汇签", "审批",
+)
+DOCUMENT_AREA_EXCLUSIONS = ("区", "area", "zone", "车间", "workshop", "库房", "仓库")
+
+
+def is_document_slot(label: str) -> bool:
+    norm = label.lower()
+    for ex in DOCUMENT_AREA_EXCLUSIONS:
+        if ex in norm and not any(strong in norm for strong in ("证书", "cert", "报告", "report", "执照", "license", "记录", "record")):
+            return False
+    return any(kw in norm for kw in DOCUMENT_KEYWORDS)
+
+
+def resolve_slot_weights(label: str, base_weights: dict[str, float] | None = None, has_ocr: bool = True) -> dict[str, float]:
+    """Dynamically assign higher OCR weight (55%) to certificate/report/record slots when OCR data is present."""
+    if has_ocr and is_document_slot(label):
+        return dict(DOCUMENT_MATCH_WEIGHTS)
+    return dict(base_weights or DEFAULT_MATCH_WEIGHTS)
+
+
 AUTO_CONFIRM_THRESHOLD = 0.35
 AUTO_CONFIRM_MIN_SEMANTIC = 0.18
 
@@ -868,18 +910,18 @@ class ProjectService:
         matrix, rows = self._vectors_and_photo_rows(project_id)
         semantic = matrix @ query_vector
         with connect(self.db_path(project_id)) as db:
-            slot = db.execute("SELECT checklist_type_id FROM checklist_slots WHERE id=?", (slot_id,)).fetchone()
+            slot = db.execute("SELECT checklist_type_id, label FROM checklist_slots WHERE id=?", (slot_id,)).fetchone()
             if not slot:
                 raise ValueError("清单项目不存在")
+            ocr = {row["photo_id"]: row["text"] for row in db.execute("SELECT photo_id, text FROM ocr_results")}
+            rejected_photo_ids = {row["photo_id"] for row in db.execute("SELECT photo_id FROM rejections WHERE slot_id=?", (slot_id,))}
         with connect(self.settings.global_db) as global_db:
             profile = global_db.execute("SELECT weights_json FROM preference_profiles WHERE name=?", (slot["checklist_type_id"],)).fetchone()
-        weights = {**DEFAULT_MATCH_WEIGHTS, **(json.loads(profile["weights_json"]) if profile else {})}
+        base_weights = {**DEFAULT_MATCH_WEIGHTS, **(json.loads(profile["weights_json"]) if profile else {})}
+        weights = resolve_slot_weights(slot["label"], base_weights, has_ocr=bool(ocr))
         semantic_weight = float(weights.get("semantic", DEFAULT_MATCH_WEIGHTS["semantic"]))
         quality_weight = float(weights.get("quality", DEFAULT_MATCH_WEIGHTS["quality"]))
         ocr_weight = float(weights.get("ocr", DEFAULT_MATCH_WEIGHTS["ocr"]))
-        with connect(self.db_path(project_id)) as db:
-            ocr = {row["photo_id"]: row["text"] for row in db.execute("SELECT photo_id, text FROM ocr_results")}
-            rejected_photo_ids = {row["photo_id"] for row in db.execute("SELECT photo_id FROM rejections WHERE slot_id=?", (slot_id,))}
         ranked: list[tuple[float, float, sqlite3.Row]] = []
         for index, row in enumerate(rows):
             if row["id"] in rejected_photo_ids:
@@ -964,7 +1006,8 @@ class ProjectService:
             norm_q = " ".join(query.split()).strip().lower()
             query_vector = cached_vectors[norm_q]
             semantic = matrix @ query_vector
-            weights = weights_by_type.get(slot["checklist_type_id"], DEFAULT_MATCH_WEIGHTS)
+            base_w = weights_by_type.get(slot["checklist_type_id"], DEFAULT_MATCH_WEIGHTS)
+            weights = resolve_slot_weights(slot["label"], base_w, has_ocr=bool(ocr_dict))
             sem_w = weights["semantic"]
             ocr_w = weights["ocr"]
             qual_w = weights["quality"]
